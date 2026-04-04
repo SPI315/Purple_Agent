@@ -127,9 +127,7 @@ def test_parse_action_rejects_top_level_array():
 
 
 def test_parse_action_accepts_valid_tool_call():
-    action = parse_action(
-        '{"name":"lookup_order","arguments":{"order_id":"12345"}}'
-    )
+    action = parse_action('{"name":"lookup_order","arguments":{"order_id":"12345"}}')
     assert action["name"] == "lookup_order"
     assert action["arguments"]["order_id"] == "12345"
 
@@ -150,7 +148,10 @@ def test_runtime_messages_include_compressed_memory():
     agent = Agent()
     agent._remember_user_input("User asks to change a flight tomorrow morning.")
     agent._remember_assistant_action(
-        {"name": "respond", "arguments": {"content": "Please share your booking reference."}}
+        {
+            "name": "respond",
+            "arguments": {"content": "Please share your booking reference."},
+        }
     )
 
     runtime_messages = agent._build_runtime_messages()
@@ -163,7 +164,7 @@ def test_runtime_messages_include_compressed_memory():
 async def send_text_message(
     text: str, url: str, context_id: str | None = None, streaming: bool = False
 ):
-    async with httpx.AsyncClient(timeout=10) as httpx_client:
+    async with httpx.AsyncClient(timeout=60) as httpx_client:
         resolver = A2ACardResolver(httpx_client=httpx_client, base_url=url)
         agent_card = await resolver.get_agent_card()
         config = ClientConfig(httpx_client=httpx_client, streaming=streaming)

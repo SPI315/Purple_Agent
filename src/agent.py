@@ -5,7 +5,8 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-import litellm
+from openai import OpenAI
+from openai import APITimeoutError, APIConnectionError, APIError
 from a2a.server.tasks import TaskUpdater
 from a2a.types import Message, Part, TaskState, TextPart
 from a2a.utils import get_message_text, new_agent_text_message
@@ -15,7 +16,9 @@ load_dotenv()
 
 
 PROMPT_PATH = Path(__file__).parent / "prompts" / "system.txt"
-DEFAULT_MODEL = "openai/gpt-4o-mini"
+DEFAULT_MODEL = "qwen/qwen3.6-plus:free"
+DEFAULT_BASE_URL = "https://api.proxyapi.ru/openrouter/v1"
+DEFAULT_TIMEOUT = 45.0
 MAX_RECENT_TURNS = 6
 MAX_MESSAGE_CHARS = 4000
 MAX_SUMMARY_ITEMS = 8
@@ -74,16 +77,35 @@ def summarize_message(text: str) -> str:
     return normalized[:237].rstrip() + "..."
 
 
+def configure_logging() -> None:
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+
 class Agent:
     def __init__(self) -> None:
+        configure_logging()
         self.model = os.getenv("AGENT_LLM", DEFAULT_MODEL)
         self.logger = logging.getLogger(__name__)
         self.system_prompt = load_system_prompt()
+        self.base_url = os.getenv("OPENAI_BASE_URL", DEFAULT_BASE_URL)
+        self.api_key = os.getenv("OPENAI_API_KEY", "")
+        self.timeout = float(os.getenv("OPENAI_TIMEOUT", str(DEFAULT_TIMEOUT)))
+        self.client = None
+        if self.model not in {"mock", "test"}:
+            self.client = OpenAI(
+                api_key=self.api_key,
+                base_url=self.base_url,
+                timeout=self.timeout,
+                max_retries=1,
+            )
         self.turn_history: list[dict[str, str]] = []
         self.memory_items: list[str] = []
 
     async def run(self, message: Message, updater: TaskUpdater) -> None:
         input_text = get_message_text(message)
+        self.logger.info("Received request with %s characters of input.", len(input_text))
 
         await updater.update_status(
             TaskState.working,
@@ -112,7 +134,12 @@ class Agent:
 
     def _generate_action(self) -> dict[str, Any]:
         runtime_messages = self._build_runtime_messages()
-        raw_output = self._call_model(runtime_messages)
+        try:
+            raw_output = self._call_model(runtime_messages)
+        except (APITimeoutError, APIConnectionError, APIError, TimeoutError, OSError, ValueError) as exc:
+            self.logger.exception("Provider request failed; using fallback action: %s", exc)
+            return FALLBACK_ACTION
+
         try:
             return parse_action(raw_output)
         except Exception as exc:
@@ -133,7 +160,7 @@ class Agent:
             try:
                 repaired_output = self._call_model(repair_messages)
                 return parse_action(repaired_output)
-            except Exception as repair_exc:
+            except (APITimeoutError, APIConnectionError, APIError, TimeoutError, OSError, ValueError) as repair_exc:
                 self.logger.warning("Repair action parse failed: %s", repair_exc)
                 self.logger.debug(
                     "Repair raw output: %s",
@@ -142,7 +169,30 @@ class Agent:
                 return FALLBACK_ACTION
 
     def _call_model(self, messages: list[dict[str, str]]) -> str:
-        response = litellm.completion(
+        if self.model in {"mock", "test"}:
+            content = json.dumps(
+                {
+                    "name": "respond",
+                    "arguments": {"content": "Mock response for local testing."},
+                },
+                ensure_ascii=True,
+            )
+            self.logger.debug("Model raw output: %s", content)
+            return content
+
+        if not self.client:
+            raise ValueError("OpenAI client is not configured.")
+        if not self.api_key:
+            raise ValueError("OPENAI_API_KEY is not set.")
+
+        self.logger.info(
+            "Calling provider model=%s base_url=%s turns=%s timeout=%ss",
+            self.model,
+            self.base_url,
+            len(messages),
+            self.timeout,
+        )
+        response = self.client.chat.completions.create(
             model=self.model,
             messages=messages,
             temperature=0.0,
@@ -151,6 +201,7 @@ class Agent:
         content = response.choices[0].message.content
         if not isinstance(content, str) or not content.strip():
             raise ValueError("Model returned empty content.")
+        self.logger.info("Provider call completed successfully.")
         self.logger.debug("Model raw output: %s", content)
         return content
 
