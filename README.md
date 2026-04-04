@@ -55,6 +55,12 @@ cp .env.example .env
 PYTHONPATH=src uv run python src/server.py --host 127.0.0.1 --port 9009
 ```
 
+If you bind to `0.0.0.0`, pass `--card-url` so the advertised agent card URL stays reachable:
+
+```bash
+PYTHONPATH=src uv run python src/server.py --host 0.0.0.0 --port 9009 --card-url http://localhost:9009/
+```
+
 5. In another terminal, run A2A conformance tests against the running server:
 
 ```bash
@@ -87,6 +93,12 @@ Run the image:
 ```bash
 docker run -p 9009:9009 --env-file .env purple-agent --host 0.0.0.0 --port 9009
 ```
+
+The Docker image is locked by `uv.lock` for reproducible builds.
+
+## Manifest
+
+`amber-manifest.json5` now points to `purple-agent:latest` for local packaging. Before publishing to AgentBeats, replace it with your public registry reference, for example `ghcr.io/<your-github-username>/purple-agent:latest`.
 
 ## Next Implementation Steps
 

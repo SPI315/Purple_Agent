@@ -9,6 +9,15 @@ from a2a.types import AgentCapabilities, AgentCard, AgentSkill
 from executor import Executor
 
 
+def build_card_url(host: str, port: int, explicit_url: str | None) -> str:
+    if explicit_url:
+        return explicit_url
+
+    # Wildcard bind addresses are not reachable client URLs.
+    advertised_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+    return f"http://{advertised_host}:{port}/"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the tau2 purple A2A agent.")
     parser.add_argument(
@@ -38,7 +47,7 @@ def main() -> None:
     agent_card = AgentCard(
         name="Tau2 Purple Agent",
         description="A tau2-compatible purple agent that selects one tool call or response per turn.",
-        url=args.card_url or f"http://{args.host}:{args.port}/",
+        url=build_card_url(args.host, args.port, args.card_url),
         version="0.1.0",
         default_input_modes=["text"],
         default_output_modes=["text"],

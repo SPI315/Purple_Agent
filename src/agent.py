@@ -80,7 +80,9 @@ def summarize_message(text: str) -> str:
 def configure_logging() -> None:
     level_name = os.getenv("LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
-    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(
+        level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
 
 
 class Agent:
@@ -105,7 +107,9 @@ class Agent:
 
     async def run(self, message: Message, updater: TaskUpdater) -> None:
         input_text = get_message_text(message)
-        self.logger.info("Received request with %s characters of input.", len(input_text))
+        self.logger.info(
+            "Received request with %s characters of input.", len(input_text)
+        )
 
         await updater.update_status(
             TaskState.working,
@@ -136,8 +140,17 @@ class Agent:
         runtime_messages = self._build_runtime_messages()
         try:
             raw_output = self._call_model(runtime_messages)
-        except (APITimeoutError, APIConnectionError, APIError, TimeoutError, OSError, ValueError) as exc:
-            self.logger.exception("Provider request failed; using fallback action: %s", exc)
+        except (
+            APITimeoutError,
+            APIConnectionError,
+            APIError,
+            TimeoutError,
+            OSError,
+            ValueError,
+        ) as exc:
+            self.logger.exception(
+                "Provider request failed; using fallback action: %s", exc
+            )
             return FALLBACK_ACTION
 
         try:
@@ -160,7 +173,14 @@ class Agent:
             try:
                 repaired_output = self._call_model(repair_messages)
                 return parse_action(repaired_output)
-            except (APITimeoutError, APIConnectionError, APIError, TimeoutError, OSError, ValueError) as repair_exc:
+            except (
+                APITimeoutError,
+                APIConnectionError,
+                APIError,
+                TimeoutError,
+                OSError,
+                ValueError,
+            ) as repair_exc:
                 self.logger.warning("Repair action parse failed: %s", repair_exc)
                 self.logger.debug(
                     "Repair raw output: %s",
