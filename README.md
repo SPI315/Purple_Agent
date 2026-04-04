@@ -51,14 +51,20 @@ cp .env.example .env
 4. Start the agent:
 
 ```bash
-uv run src/server.py --host 127.0.0.1 --port 9009
+PYTHONPATH=src uv run python src/server.py --host 127.0.0.1 --port 9009
 ```
 
 5. In another terminal, run A2A conformance tests against the running server:
 
 ```bash
 uv sync --extra test
-uv run pytest --agent-url http://localhost:9009
+PYTHONPATH=src uv run pytest tests --agent-url http://localhost:9009
+```
+
+If you want a quick manual request against the running agent, use:
+
+```bash
+PYTHONPATH=src uv run python -c "import asyncio; from tests.test_agent import send_text_message; events = asyncio.run(send_text_message('Hello', 'http://localhost:9009', streaming=False)); print(events)"
 ```
 
 ## Docker

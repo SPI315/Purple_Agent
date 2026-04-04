@@ -17,7 +17,7 @@ load_dotenv()
 
 PROMPT_PATH = Path(__file__).parent / "prompts" / "system.txt"
 DEFAULT_MODEL = "qwen/qwen3.6-plus:free"
-DEFAULT_BASE_URL = "https://api.proxyapi.ru/openrouter/v1"
+DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_TIMEOUT = 45.0
 MAX_RECENT_TURNS = 6
 MAX_MESSAGE_CHARS = 4000
