@@ -111,7 +111,7 @@ The agent must not carry over:
 ## Runtime
 
 - Python A2A server built from `agent-template`
-- model access via an OpenAI-like endpoint or LiteLLM-compatible routing layer
+- model access via an OpenAI-compatible endpoint
 - environment-driven configuration
 
 ## Suggested Files
@@ -164,9 +164,9 @@ Recommended practices:
 Recommended environment variables:
 
 - `AGENT_LLM`
+- `OPENAI_BASE_URL`
 - `OPENAI_API_KEY`
-- `GEMINI_API_KEY`
-- `DEEPSEEK_API_KEY`
+- `OPENAI_TIMEOUT`
 - `LOG_LEVEL`
 
 ## Evaluation Priorities
@@ -217,7 +217,7 @@ Current status:
 Current status:
 
 - regression tests for malformed outputs: partially done
-- improve logging: partially done
+- improve logging: done
 - harden validation and fallback behavior: partially done
 
 ## Phase 3: Performance
@@ -248,7 +248,7 @@ To align with AgentBeats and competition expectations, the repository should inc
 Current status:
 
 - clear README: done
-- reproducible local setup: documented, not yet verified
+- reproducible local setup: documented and locally validated
 - Docker support: done
 - environment-based configuration: done
 - basic tests: done
@@ -256,12 +256,10 @@ Current status:
 
 ## Remaining Checklist
 
-- run `uv sync`
-- start the local A2A server successfully
-- run `pytest` against the local agent
 - run one local tau2 evaluation against the tau2 green agent
 - inspect failures on at least one real task
 - add stronger validation for suspicious tool names or malformed arguments
+- add regression coverage for numeric fidelity and long-context stability
 - tune prompt and memory handling based on real tau2 traces
 
 ## Non-Goals

@@ -24,9 +24,9 @@ The agent is intended to participate in tau2 customer-service evaluations as a p
 Expected environment variables:
 
 - `AGENT_LLM`
+- `OPENAI_BASE_URL`
 - `OPENAI_API_KEY`
-- `GEMINI_API_KEY`
-- `DEEPSEEK_API_KEY`
+- `OPENAI_TIMEOUT`
 - `LOG_LEVEL`
 
 ## Local Setup
@@ -46,7 +46,8 @@ cp .env.example .env
 3. Fill in at least:
 
 - `AGENT_LLM`
-- one matching provider key such as `OPENAI_API_KEY`
+- `OPENAI_BASE_URL`
+- `OPENAI_API_KEY`
 
 4. Start the agent:
 
@@ -67,6 +68,12 @@ If you want a quick manual request against the running agent, use:
 PYTHONPATH=src uv run python -c "import asyncio; from tests.test_agent import send_text_message; events = asyncio.run(send_text_message('Hello', 'http://localhost:9009', streaming=False)); print(events)"
 ```
 
+For offline smoke tests without a real provider call, you can run the server with:
+
+```bash
+AGENT_LLM=mock PYTHONPATH=src uv run python src/server.py --host 127.0.0.1 --port 9009
+```
+
 ## Docker
 
 Build the image:
@@ -84,6 +91,6 @@ docker run -p 9009:9009 --env-file .env purple-agent --host 0.0.0.0 --port 9009
 ## Next Implementation Steps
 
 1. Improve `src/agent.py` for tau2-specific tool selection and policy handling.
-2. Add structured logging for invalid model outputs and repair attempts.
+2. Add stronger regression tests for numeric fidelity, policy edge cases, and long-context behavior.
 3. Test against the tau2 green agent on a small `airline` run.
 4. Tune prompts and model settings for pass rate and cost.
