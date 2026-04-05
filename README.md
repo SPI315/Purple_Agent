@@ -23,9 +23,11 @@ The agent is intended to participate in tau2 customer-service evaluations as a p
 
 Expected environment variables:
 
+- `AGENT_PROVIDER`
 - `AGENT_LLM`
 - `OPENAI_BASE_URL`
 - `OPENAI_API_KEY`
+- `OPENROUTER_API_KEY`
 - `OPENAI_TIMEOUT`
 - `LOG_LEVEL`
 
@@ -45,9 +47,22 @@ cp .env.example .env
 
 3. Fill in at least:
 
+- `AGENT_PROVIDER`
 - `AGENT_LLM`
-- `OPENAI_BASE_URL`
-- `OPENAI_API_KEY`
+- one provider key:
+  - `OPENAI_API_KEY`
+  - `GEMINI_API_KEY`
+  - `DEEPSEEK_API_KEY`
+  - `OPENROUTER_API_KEY` or `OPENAI_API_KEY` for OpenRouter
+
+Provider examples:
+
+- `AGENT_PROVIDER=openai`, `AGENT_LLM=gpt-4o-mini`
+- `AGENT_PROVIDER=gemini`, `AGENT_LLM=gemini-2.5-flash`
+- `AGENT_PROVIDER=deepseek`, `AGENT_LLM=deepseek-chat`
+- `AGENT_PROVIDER=openrouter`, `AGENT_LLM=qwen/qwen3.6-plus:free`, `OPENAI_BASE_URL=https://openrouter.ai/api/v1`
+
+If `AGENT_PROVIDER=auto`, the agent infers the provider from the model prefix (`openai/...`, `gemini/...`, `deepseek/...`) or from an OpenRouter base URL/key.
 
 4. Start the agent:
 

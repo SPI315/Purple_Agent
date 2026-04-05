@@ -3,10 +3,12 @@
   config_schema: {
     type: "object",
     properties: {
+      agent_provider: { type: "string", default: "auto" },
       agent_llm: { type: "string" },
       openai_base_url: { type: "string", default: "https://openrouter.ai/api/v1" },
       openai_timeout: { type: "string", default: "45" },
       openai_api_key: { type: "string", secret: true, default: "" },
+      openrouter_api_key: { type: "string", secret: true, default: "" },
       gemini_api_key: { type: "string", secret: true, default: "" },
       deepseek_api_key: { type: "string", secret: true, default: "" },
     },
@@ -20,10 +22,12 @@
     image: "ghcr.io/spi315/purple-agent:latest",
     entrypoint: ["uv", "run", "src/server.py", "--host", "0.0.0.0", "--port", "9009"],
     env: {
+      AGENT_PROVIDER: "${config.agent_provider}",
       AGENT_LLM: "${config.agent_llm}",
       OPENAI_BASE_URL: "${config.openai_base_url}",
       OPENAI_TIMEOUT: "${config.openai_timeout}",
       OPENAI_API_KEY: "${config.openai_api_key}",
+      OPENROUTER_API_KEY: "${config.openrouter_api_key}",
       GEMINI_API_KEY: "${config.gemini_api_key}",
       DEEPSEEK_API_KEY: "${config.deepseek_api_key}",
       LOG_LEVEL: "INFO",

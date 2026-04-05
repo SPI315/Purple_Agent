@@ -5,8 +5,19 @@ import httpx
 import pytest
 from a2a.client import A2ACardResolver, ClientConfig, ClientFactory
 from a2a.types import Message, Part, Role, TextPart
+from openai import RateLimitError
 
-from agent import Agent, parse_action, summarize_message, truncate_text, validate_action
+from agent import (
+    Agent,
+    build_fallback_action,
+    extract_allowed_tools,
+    is_generic_clarify_response,
+    parse_action,
+    resolve_provider_config,
+    summarize_message,
+    truncate_text,
+    validate_action,
+)
 
 
 def validate_agent_card(card_data: dict[str, Any]) -> list[str]:
@@ -159,6 +170,216 @@ def test_runtime_messages_include_compressed_memory():
 
     assert len(system_messages) == 2
     assert "Compressed memory from earlier turns:" in system_messages[1]["content"]
+
+
+def test_build_fallback_action_uses_reservation_id_when_present():
+    action = build_fallback_action("Please cancel reservation EHGLP3 right away.")
+    assert action["name"] == "respond"
+    assert "EHGLP3" in action["arguments"]["content"]
+
+
+def test_build_fallback_action_requests_identifier_when_none_present():
+    action = build_fallback_action("I need help with my booking.")
+    assert action["name"] == "respond"
+    assert "reservation ID or user ID" in action["arguments"]["content"]
+
+
+def test_extract_allowed_tools_reads_json_name_fields():
+    input_text = """
+    Available tools:
+    {"name":"get_reservation_details","arguments":{"reservation_id":"string"}}
+    {"name":"cancel_reservation","arguments":{"reservation_id":"string"}}
+    """
+    assert extract_allowed_tools(input_text) == {
+        "get_reservation_details",
+        "cancel_reservation",
+    }
+
+
+def test_is_generic_clarify_response_detects_default_fallback():
+    assert is_generic_clarify_response(
+        {"name": "respond", "arguments": {"content": "I'm sorry, could you clarify your request?"}}
+    )
+
+
+def test_call_model_rejects_empty_choices():
+    agent = Agent()
+    agent.model = "real"
+    agent.api_key = "test-key"
+
+    class DummyClient:
+        class Chat:
+            class Completions:
+                @staticmethod
+                def create(**_: Any):
+                    class Response:
+                        choices: list[Any] = []
+
+                    return Response()
+
+            completions = Completions()
+
+        chat = Chat()
+
+    agent.client = DummyClient()
+
+    with pytest.raises(ValueError, match="no choices"):
+        agent._call_model([{"role": "system", "content": "test"}])
+
+
+def test_call_model_rejects_none_content():
+    agent = Agent()
+    agent.model = "real"
+    agent.api_key = "test-key"
+
+    class DummyMessage:
+        content = None
+
+    class DummyChoice:
+        message = DummyMessage()
+
+    class DummyClient:
+        class Chat:
+            class Completions:
+                @staticmethod
+                def create(**_: Any):
+                    class Response:
+                        choices = [DummyChoice()]
+
+                    return Response()
+
+            completions = Completions()
+
+        chat = Chat()
+
+    agent.client = DummyClient()
+
+    with pytest.raises(ValueError, match="empty or malformed content"):
+        agent._call_model([{"role": "system", "content": "test"}])
+
+
+def test_call_model_retries_on_rate_limit():
+    agent = Agent()
+    agent.model = "real"
+    agent.api_key = "test-key"
+    attempts = {"count": 0}
+
+    class DummyMessage:
+        content = '{"name":"respond","arguments":{"content":"ok"}}'
+
+    class DummyChoice:
+        message = DummyMessage()
+
+    class DummyClient:
+        class Chat:
+            class Completions:
+                @staticmethod
+                def create(**_: Any):
+                    attempts["count"] += 1
+                    if attempts["count"] < 3:
+                        raise RateLimitError(
+                            "rate limited",
+                            response=httpx.Response(429, request=httpx.Request("POST", "https://example.com")),
+                            body=None,
+                        )
+
+                    class Response:
+                        choices = [DummyChoice()]
+
+                    return Response()
+
+            completions = Completions()
+
+        chat = Chat()
+
+    agent.client = DummyClient()
+
+    output = agent._call_model([{"role": "system", "content": "test"}])
+    assert attempts["count"] == 3
+    assert output == '{"name":"respond","arguments":{"content":"ok"}}'
+
+
+def test_postprocess_replaces_unknown_tool_with_contextual_fallback():
+    agent = Agent()
+    agent.current_input_text = """
+    User asks to cancel reservation EHGLP3.
+    Available tools:
+    {"name":"get_reservation_details","arguments":{"reservation_id":"string"}}
+    {"name":"cancel_reservation","arguments":{"reservation_id":"string"}}
+    """
+
+    action = agent._postprocess_action(
+        {"name": "search_flights", "arguments": {"origin": "PHX"}},
+        runtime_messages=[{"role": "system", "content": "test"}],
+        raw_output='{"name":"search_flights","arguments":{"origin":"PHX"}}',
+    )
+
+    assert action["name"] == "respond"
+    assert "EHGLP3" in action["arguments"]["content"]
+
+
+def test_resolve_provider_config_for_openai_prefix(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("AGENT_PROVIDER", "auto")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+
+    config = resolve_provider_config("openai/gpt-4o-mini")
+
+    assert config["provider"] == "openai"
+    assert config["model"] == "gpt-4o-mini"
+    assert config["api_key"] == "openai-key"
+    assert config["base_url"] == "https://api.openai.com/v1"
+
+
+def test_resolve_provider_config_for_gemini_prefix(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("AGENT_PROVIDER", "auto")
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
+
+    config = resolve_provider_config("gemini/gemini-2.5-flash")
+
+    assert config["provider"] == "gemini"
+    assert config["model"] == "gemini-2.5-flash"
+    assert config["api_key"] == "gemini-key"
+    assert "generativelanguage.googleapis.com" in config["base_url"]
+
+
+def test_resolve_provider_config_for_deepseek_prefix(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("AGENT_PROVIDER", "auto")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-key")
+
+    config = resolve_provider_config("deepseek/deepseek-chat")
+
+    assert config["provider"] == "deepseek"
+    assert config["model"] == "deepseek-chat"
+    assert config["api_key"] == "deepseek-key"
+    assert config["base_url"] == "https://api.deepseek.com"
+
+
+def test_resolve_provider_config_for_openrouter_provider(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("AGENT_PROVIDER", "openrouter")
+    monkeypatch.setenv("AGENT_LLM", "qwen/qwen3.6-plus:free")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-key")
+
+    config = resolve_provider_config("qwen/qwen3.6-plus:free")
+
+    assert config["provider"] == "openrouter"
+    assert config["model"] == "qwen/qwen3.6-plus:free"
+    assert config["api_key"] == "openrouter-key"
+    assert config["base_url"] == "https://openrouter.ai/api/v1"
+
+
+def test_resolve_provider_config_auto_detects_openrouter(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("AGENT_PROVIDER", "auto")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "compat-key")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    config = resolve_provider_config("qwen/qwen3.6-plus:free")
+
+    assert config["provider"] == "openrouter"
+    assert config["model"] == "qwen/qwen3.6-plus:free"
+    assert config["api_key"] == "compat-key"
 
 
 async def send_text_message(
