@@ -11,11 +11,11 @@ from agent import (
     Agent,
     build_fallback_action,
     extract_allowed_tools,
-    is_generic_clarify_response,
+    is_disallowed_respond_content,
     parse_action,
+    policy_allows_handoff,
     resolve_provider_config,
     summarize_message,
-    truncate_text,
     validate_action,
 )
 
@@ -132,22 +132,26 @@ def test_validate_action_rejects_empty_respond():
         validate_action({"name": "respond", "arguments": {"content": ""}})
 
 
+def test_validate_action_rejects_tool_outside_runtime_list():
+    with pytest.raises(ValueError, match="runtime tool list"):
+        validate_action(
+            {"name": "search_flights", "arguments": {"origin": "PHX"}},
+            allowed_tools={"cancel_reservation"},
+        )
+
+
 def test_parse_action_rejects_top_level_array():
     with pytest.raises(ValueError):
         parse_action('[{"name":"respond","arguments":{"content":"Hi"}}]')
 
 
 def test_parse_action_accepts_valid_tool_call():
-    action = parse_action('{"name":"lookup_order","arguments":{"order_id":"12345"}}')
+    action = parse_action(
+        '{"name":"lookup_order","arguments":{"order_id":"12345"}}',
+        allowed_tools={"lookup_order"},
+    )
     assert action["name"] == "lookup_order"
     assert action["arguments"]["order_id"] == "12345"
-
-
-def test_truncate_text_shortens_long_inputs():
-    text = "a" * 5000
-    truncated = truncate_text(text, limit=100)
-    assert len(truncated) <= 100
-    assert truncated.endswith("...[truncated]")
 
 
 def test_summarize_message_compacts_whitespace():
@@ -155,21 +159,27 @@ def test_summarize_message_compacts_whitespace():
     assert summary == "Hello there this is a test"
 
 
-def test_runtime_messages_include_compressed_memory():
+def test_build_runtime_messages_keep_first_prompt_and_recent_turns():
     agent = Agent()
-    agent._remember_user_input("User asks to change a flight tomorrow morning.")
-    agent._remember_assistant_action(
+    first_prompt = """
+    Policy: follow the tool contract.
+    Available tools:
+    {"name":"get_reservation_details","arguments":{"reservation_id":"string"}}
+    """
+    agent._store_user_turn(first_prompt)
+    agent.turn_history.append(
         {
-            "name": "respond",
-            "arguments": {"content": "Please share your booking reference."},
+            "role": "assistant",
+            "content": '{"name":"get_reservation_details","arguments":{"reservation_id":"EHGLP3"}}',
         }
     )
+    agent._store_user_turn("Tool result says the reservation is eligible.")
 
     runtime_messages = agent._build_runtime_messages()
-    system_messages = [msg for msg in runtime_messages if msg["role"] == "system"]
 
-    assert len(system_messages) == 2
-    assert "Compressed memory from earlier turns:" in system_messages[1]["content"]
+    assert runtime_messages[1]["role"] == "user"
+    assert runtime_messages[1]["content"] == first_prompt
+    assert runtime_messages[-1]["content"] == "Tool result says the reservation is eligible."
 
 
 def test_build_fallback_action_uses_reservation_id_when_present():
@@ -184,11 +194,16 @@ def test_build_fallback_action_requests_identifier_when_none_present():
     assert "reservation ID or user ID" in action["arguments"]["content"]
 
 
-def test_extract_allowed_tools_reads_json_name_fields():
+def test_extract_allowed_tools_reads_exact_tool_block():
     input_text = """
+    System policy here.
+
     Available tools:
     {"name":"get_reservation_details","arguments":{"reservation_id":"string"}}
     {"name":"cancel_reservation","arguments":{"reservation_id":"string"}}
+
+    Conversation:
+    User: Please help me.
     """
     assert extract_allowed_tools(input_text) == {
         "get_reservation_details",
@@ -196,9 +211,35 @@ def test_extract_allowed_tools_reads_json_name_fields():
     }
 
 
-def test_is_generic_clarify_response_detects_default_fallback():
-    assert is_generic_clarify_response(
-        {"name": "respond", "arguments": {"content": "I'm sorry, could you clarify your request?"}}
+def test_policy_allows_handoff_detects_explicit_transfer_language():
+    prompt = "Policy: transfer to a human agent when the user requests legal escalation."
+    assert policy_allows_handoff(prompt) is True
+
+
+def test_is_disallowed_respond_content_rejects_fake_incapability_with_tools():
+    assert is_disallowed_respond_content(
+        "I can't access your booking right now.",
+        initial_prompt="Available tools are listed below.",
+        allowed_tools={"get_reservation_details"},
+        current_input_text="Please check reservation EHGLP3.",
+    )
+
+
+def test_is_disallowed_respond_content_rejects_broad_clarify_with_identifier():
+    assert is_disallowed_respond_content(
+        "Could you please clarify your request?",
+        initial_prompt="Available tools are listed below.",
+        allowed_tools={"cancel_reservation"},
+        current_input_text="Please cancel reservation EHGLP3.",
+    )
+
+
+def test_is_disallowed_respond_content_allows_handoff_when_policy_explicit():
+    assert not is_disallowed_respond_content(
+        "I will transfer you to a human agent for this request.",
+        initial_prompt="Policy: transfer to a human agent for harassment complaints.",
+        allowed_tools={"get_reservation_details"},
+        current_input_text="I want to report harassment.",
     )
 
 
@@ -299,20 +340,173 @@ def test_call_model_retries_on_rate_limit():
     assert output == '{"name":"respond","arguments":{"content":"ok"}}'
 
 
-def test_postprocess_replaces_unknown_tool_with_contextual_fallback():
+def test_generate_action_returns_safe_respond_for_invalid_json(monkeypatch: pytest.MonkeyPatch):
     agent = Agent()
-    agent.current_input_text = """
-    User asks to cancel reservation EHGLP3.
+    prompt = """
     Available tools:
-    {"name":"get_reservation_details","arguments":{"reservation_id":"string"}}
     {"name":"cancel_reservation","arguments":{"reservation_id":"string"}}
     """
+    agent._store_user_turn(prompt)
+    agent.current_input_text = "Please cancel reservation EHGLP3."
 
-    action = agent._postprocess_action(
-        {"name": "search_flights", "arguments": {"origin": "PHX"}},
-        runtime_messages=[{"role": "system", "content": "test"}],
-        raw_output='{"name":"search_flights","arguments":{"origin":"PHX"}}',
+    call_count = {"count": 0}
+
+    def fake_call_model(messages: list[dict[str, str]]) -> str:
+        call_count["count"] += 1
+        assert messages[1]["content"] == prompt
+        return "not json"
+
+    monkeypatch.setattr(agent, "_call_model", fake_call_model)
+
+    action = agent._generate_action()
+
+    assert call_count["count"] == 1
+    assert action["name"] == "respond"
+    assert "EHGLP3" in action["arguments"]["content"]
+
+
+def test_generate_action_returns_safe_respond_for_invalid_tool(monkeypatch: pytest.MonkeyPatch):
+    agent = Agent()
+    agent._store_user_turn(
+        """
+        Available tools:
+        {"name":"cancel_reservation","arguments":{"reservation_id":"string"}}
+        """
     )
+    agent.current_input_text = "Please cancel reservation EHGLP3."
+
+    call_count = {"count": 0}
+
+    def fake_call_model(_: list[dict[str, str]]) -> str:
+        call_count["count"] += 1
+        return '{"name":"search_flights","arguments":{"origin":"PHX"}}'
+
+    monkeypatch.setattr(agent, "_call_model", fake_call_model)
+
+    action = agent._generate_action()
+
+    assert call_count["count"] == 1
+    assert action["name"] == "respond"
+    assert "EHGLP3" in action["arguments"]["content"]
+
+
+def test_generate_action_uses_single_model_call_on_happy_path(monkeypatch: pytest.MonkeyPatch):
+    agent = Agent()
+    prompt = """
+    Available tools:
+    {"name":"cancel_reservation","arguments":{"reservation_id":"string"}}
+    """
+    agent._store_user_turn(prompt)
+    agent.current_input_text = "Please cancel reservation EHGLP3."
+
+    call_count = {"count": 0}
+
+    def fake_call_model(messages: list[dict[str, str]]) -> str:
+        call_count["count"] += 1
+        assert len(messages) == 2
+        return '{"name":"cancel_reservation","arguments":{"reservation_id":"EHGLP3"}}'
+
+    monkeypatch.setattr(agent, "_call_model", fake_call_model)
+
+    action = agent._generate_action()
+
+    assert call_count["count"] == 1
+    assert action == {
+        "name": "cancel_reservation",
+        "arguments": {"reservation_id": "EHGLP3"},
+    }
+
+
+def test_generate_action_rejects_handoff_respond_when_policy_does_not_allow_it(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    agent = Agent()
+    prompt = """
+    Available tools:
+    {"name":"get_reservation_details","arguments":{"reservation_id":"string"}}
+    """
+    agent._store_user_turn(prompt)
+    agent.current_input_text = "Please check reservation EHGLP3."
+
+    call_count = {"count": 0}
+
+    def fake_call_model(_: list[dict[str, str]]) -> str:
+        call_count["count"] += 1
+        return '{"name":"respond","arguments":{"content":"You are being transferred to a human agent."}}'
+
+    monkeypatch.setattr(agent, "_call_model", fake_call_model)
+
+    action = agent._generate_action()
+
+    assert call_count["count"] == 1
+    assert action["name"] == "respond"
+    assert "EHGLP3" in action["arguments"]["content"]
+
+
+def test_generate_action_allows_handoff_when_policy_explicitly_requires_it(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    agent = Agent()
+    prompt = """
+    Policy: transfer to a human agent for harassment complaints.
+    Available tools:
+    {"name":"get_reservation_details","arguments":{"reservation_id":"string"}}
+    """
+    agent._store_user_turn(prompt)
+    agent.current_input_text = "I want to report harassment."
+
+    def fake_call_model(_: list[dict[str, str]]) -> str:
+        return '{"name":"respond","arguments":{"content":"I will transfer you to a human agent for this request."}}'
+
+    monkeypatch.setattr(agent, "_call_model", fake_call_model)
+
+    action = agent._generate_action()
+
+    assert action == {
+        "name": "respond",
+        "arguments": {"content": "I will transfer you to a human agent for this request."},
+    }
+
+
+def test_generate_action_rejects_fake_incapability_claim_when_tools_exist(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    agent = Agent()
+    prompt = """
+    Available tools:
+    {"name":"get_reservation_details","arguments":{"reservation_id":"string"}}
+    """
+    agent._store_user_turn(prompt)
+    agent.current_input_text = "Please check reservation EHGLP3."
+
+    def fake_call_model(_: list[dict[str, str]]) -> str:
+        return '{"name":"respond","arguments":{"content":"I cannot access your booking right now."}}'
+
+    monkeypatch.setattr(agent, "_call_model", fake_call_model)
+
+    action = agent._generate_action()
+
+    assert action["name"] == "respond"
+    assert "EHGLP3" in action["arguments"]["content"]
+
+
+def test_generate_action_rejects_broad_clarify_when_identifier_already_present(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    agent = Agent()
+    prompt = """
+    Available tools:
+    {"name":"cancel_reservation","arguments":{"reservation_id":"string"}}
+    """
+    agent._store_user_turn(prompt)
+    agent.current_input_text = "Please cancel reservation EHGLP3."
+
+    def fake_call_model(_: list[dict[str, str]]) -> str:
+        return '{"name":"respond","arguments":{"content":"Could you please clarify your request?"}}'
+
+    monkeypatch.setattr(agent, "_call_model", fake_call_model)
+
+    action = agent._generate_action()
 
     assert action["name"] == "respond"
     assert "EHGLP3" in action["arguments"]["content"]
@@ -383,7 +577,10 @@ def test_resolve_provider_config_auto_detects_openrouter(monkeypatch: pytest.Mon
 
 
 async def send_text_message(
-    text: str, url: str, context_id: str | None = None, streaming: bool = False
+    text: str,
+    url: str,
+    context_id: str | None = None,
+    streaming: bool = False,
 ):
     async with httpx.AsyncClient(timeout=60) as httpx_client:
         resolver = A2ACardResolver(httpx_client=httpx_client, base_url=url)
