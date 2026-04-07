@@ -25,7 +25,7 @@ DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEFAULT_TIMEOUT = 45.0
-MAX_RECENT_TURNS = 6
+MAX_RECENT_TURNS = 12
 MAX_PROVIDER_RETRIES = 3
 RATE_LIMIT_BACKOFF_SECONDS = 1.5
 TOOL_SECTION_HEADERS = (
@@ -33,6 +33,7 @@ TOOL_SECTION_HEADERS = (
     "tool list:",
     "tools:",
 )
+TAU2_TOOLS_ANCHOR = "Here's a list of tools you can use"
 HANDOFF_PHRASES = (
     "transfer",
     "human agent",
@@ -65,7 +66,7 @@ BROAD_CLARIFY_PHRASES = (
 )
 FALLBACK_ACTION = {
     "name": "respond",
-    "arguments": {"content": "Could you share your reservation ID or user ID?"},
+    "arguments": {"content": "I'm sorry, I couldn't complete that request right now."},
 }
 USER_ID_PATTERN = re.compile(r"\b[a-z]+(?:_[a-z]+)+_\d{3,}\b", re.IGNORECASE)
 RESERVATION_ID_PATTERN = re.compile(r"\b[A-Z0-9]{6}\b")
@@ -144,21 +145,16 @@ def extract_identifiers(text: str) -> dict[str, list[str]]:
     }
 
 
-def build_fallback_action(input_text: str) -> dict[str, Any]:
-    identifiers = extract_identifiers(input_text)
-
-    if identifiers["reservation_ids"]:
-        reservation_id = identifiers["reservation_ids"][0]
-        content = (
-            f"Please confirm what you would like me to do with reservation ID {reservation_id}."
-        )
-    elif identifiers["user_ids"]:
-        user_id = identifiers["user_ids"][0]
-        content = f"Please confirm what you would like me to do with user ID {user_id}."
-    else:
-        content = FALLBACK_ACTION["arguments"]["content"]
-
-    return {"name": "respond", "arguments": {"content": content}}
+def build_fallback_action(
+    input_text: str,
+    *,
+    context_text: str | None = None,
+) -> dict[str, Any]:
+    del input_text, context_text
+    return {
+        "name": "respond",
+        "arguments": {"content": FALLBACK_ACTION["arguments"]["content"]},
+    }
 
 
 def _extract_tool_objects(tool_block: str) -> list[dict[str, Any]]:
@@ -201,7 +197,75 @@ def _extract_tool_objects(tool_block: str) -> list[dict[str, Any]]:
     return objects
 
 
+def extract_allowed_tools_from_tau2_prompt(text: str) -> set[str]:
+    anchor_start = text.find(TAU2_TOOLS_ANCHOR)
+    if anchor_start == -1:
+        return set()
+
+    array_start = text.find("[", anchor_start)
+    if array_start == -1:
+        return set()
+
+    depth = 0
+    in_string = False
+    escaped = False
+    array_end = -1
+    for index in range(array_start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+                continue
+            if char == "\\":
+                escaped = True
+                continue
+            if char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+            continue
+        if char == "[":
+            depth += 1
+            continue
+        if char == "]":
+            depth -= 1
+            if depth == 0:
+                array_end = index
+                break
+
+    if array_end == -1:
+        return set()
+
+    raw_array = text[array_start : array_end + 1]
+    try:
+        parsed = json.loads(raw_array)
+    except json.JSONDecodeError:
+        return set()
+
+    if not isinstance(parsed, list):
+        return set()
+
+    names: set[str] = set()
+    for tool in parsed:
+        if not isinstance(tool, dict):
+            continue
+        function_obj = tool.get("function")
+        if isinstance(function_obj, dict) and isinstance(function_obj.get("name"), str):
+            if function_obj["name"] != "respond":
+                names.add(function_obj["name"])
+            continue
+        if isinstance(tool.get("name"), str) and tool["name"] != "respond":
+            names.add(tool["name"])
+    return names
+
+
 def extract_allowed_tools(input_text: str) -> set[str]:
+    tau2_tools = extract_allowed_tools_from_tau2_prompt(input_text)
+    if tau2_tools:
+        return tau2_tools
+
     lowered = input_text.lower()
     start_index = -1
     for header in TOOL_SECTION_HEADERS:
@@ -245,16 +309,10 @@ def is_disallowed_respond_content(
     allowed_tools: set[str] | None,
     current_input_text: str,
 ) -> bool:
-    identifiers = extract_identifiers(current_input_text)
-    has_identifiers = bool(identifiers["reservation_ids"] or identifiers["user_ids"])
-
     if _contains_any_phrase(content, HANDOFF_PHRASES) and not policy_allows_handoff(initial_prompt):
         return True
 
     if has_lookup_or_action_tools(allowed_tools) and _contains_any_phrase(content, INCAPABILITY_PHRASES):
-        return True
-
-    if has_identifiers and _contains_any_phrase(content, BROAD_CLARIFY_PHRASES):
         return True
 
     return False
@@ -346,6 +404,12 @@ class Agent:
         self.base_url = provider_config.get("base_url", "")
         self.api_key = provider_config.get("api_key", "")
         self.timeout = float(os.getenv("OPENAI_TIMEOUT", str(DEFAULT_TIMEOUT)))
+        self.allow_empty_toolset_debug = os.getenv("AGENT_ALLOW_EMPTY_TOOLSET_DEBUG", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         self.client = None
         if self.model not in {"mock", "test"}:
             self.client = OpenAI(
@@ -399,6 +463,10 @@ class Agent:
                 "Initialized context with %s allowed runtime tools.",
                 len(self.allowed_tools),
             )
+            if not self.allowed_tools:
+                self.logger.error(
+                    "Runtime tools extraction failed: allowed_tools is empty on first turn"
+                )
             return
 
         self.turn_history.append({"role": "user", "content": input_text})
@@ -425,14 +493,58 @@ class Agent:
                 "Provider request failed; using fallback action: %s",
                 exc,
             )
-            return build_fallback_action(self.current_input_text)
+            return build_fallback_action(
+                self.current_input_text,
+                context_text=self._build_context_text(),
+            )
+
+        action_name: str | None = None
+        try:
+            parsed_output = json.loads(raw_output)
+            if isinstance(parsed_output, dict):
+                maybe_name = parsed_output.get("name")
+                if isinstance(maybe_name, str):
+                    action_name = maybe_name
+        except json.JSONDecodeError:
+            action_name = None
+
+        validation_tools = self.allowed_tools
+        if validation_tools == set():
+            if self.allow_empty_toolset_debug:
+                self.logger.error(
+                    "allowed_tools is empty; skipping tool-name validation for this turn because AGENT_ALLOW_EMPTY_TOOLSET_DEBUG is enabled"
+                )
+                validation_tools = None
+            else:
+                self.logger.error(
+                    "allowed_tools is empty on validation path; returning generic fallback"
+                )
+                return build_fallback_action(
+                    self.current_input_text,
+                    context_text=self._build_context_text(),
+                )
+        self.logger.info(
+            "Validating action: name=%r allowed_tools_count=%d allowed_tools=%s initial_prompt_detected=%s",
+            action_name,
+            len(self.allowed_tools or set()),
+            sorted(list(self.allowed_tools or set()))[:20],
+            self.initial_prompt is not None,
+        )
 
         try:
-            action = parse_action(raw_output, allowed_tools=self.allowed_tools)
+            action = parse_action(raw_output, allowed_tools=validation_tools)
         except ValueError as exc:
             self.logger.warning("Primary action validation failed: %s", exc)
+            self.logger.warning(
+                "Action validation failed: action_name=%r not in allowed_tools=%s",
+                action_name,
+                sorted(list(self.allowed_tools or set()))[:20],
+            )
             self.logger.debug("Primary raw output: %s", summarize_message(raw_output))
-            return build_fallback_action(self.current_input_text)
+            return build_fallback_action(
+                self.current_input_text,
+                context_text=self._build_context_text(),
+            )
 
         if action["name"] == "respond":
             content = str(action["arguments"].get("content", ""))
@@ -445,7 +557,10 @@ class Agent:
                 self.logger.warning(
                     "Rejecting respond action due to disallowed surrender-style content."
                 )
-                return build_fallback_action(self.current_input_text)
+                return build_fallback_action(
+                    self.current_input_text,
+                    context_text=self._build_context_text(),
+                )
 
         return action
 
@@ -520,3 +635,15 @@ class Agent:
             messages.append({"role": "user", "content": self.initial_prompt})
         messages.extend(self.turn_history[-MAX_RECENT_TURNS:])
         return messages
+
+    def _build_context_text(self) -> str:
+        chunks: list[str] = []
+        if self.initial_prompt:
+            chunks.append(self.initial_prompt)
+        for turn in self.turn_history:
+            content = turn.get("content")
+            if isinstance(content, str) and content:
+                chunks.append(content)
+        if self.current_input_text:
+            chunks.append(self.current_input_text)
+        return "\n".join(chunks)

@@ -11,6 +11,7 @@ from agent import (
     Agent,
     build_fallback_action,
     extract_allowed_tools,
+    extract_allowed_tools_from_tau2_prompt,
     is_disallowed_respond_content,
     parse_action,
     policy_allows_handoff,
@@ -154,6 +155,17 @@ def test_parse_action_accepts_valid_tool_call():
     assert action["arguments"]["order_id"] == "12345"
 
 
+def test_parse_action_accepts_runtime_tool_name_from_tau2():
+    action = parse_action(
+        '{"name":"yara_garcia_123","arguments":{"reservation_id":"HXDUBJ"}}',
+        allowed_tools={"yara_garcia_123"},
+    )
+    assert action == {
+        "name": "yara_garcia_123",
+        "arguments": {"reservation_id": "HXDUBJ"},
+    }
+
+
 def test_summarize_message_compacts_whitespace():
     summary = summarize_message("Hello   there\n\nthis is   a   test")
     assert summary == "Hello there this is a test"
@@ -182,16 +194,44 @@ def test_build_runtime_messages_keep_first_prompt_and_recent_turns():
     assert runtime_messages[-1]["content"] == "Tool result says the reservation is eligible."
 
 
+def test_store_user_turn_does_not_overwrite_first_turn_allowed_tools():
+    agent = Agent()
+    first_prompt = """
+    Here's a list of tools you can use (you can use at most one tool at a time):
+    [{"type":"function","function":{"name":"first_tool"}}]
+    """
+    agent._store_user_turn(first_prompt)
+    assert agent.allowed_tools == {"first_tool"}
+
+    agent._store_user_turn("second turn without full tool contract")
+    assert agent.allowed_tools == {"first_tool"}
+
+
 def test_build_fallback_action_uses_reservation_id_when_present():
     action = build_fallback_action("Please cancel reservation EHGLP3 right away.")
     assert action["name"] == "respond"
-    assert "EHGLP3" in action["arguments"]["content"]
+    assert "couldn't complete that request" in action["arguments"]["content"]
 
 
 def test_build_fallback_action_requests_identifier_when_none_present():
     action = build_fallback_action("I need help with my booking.")
     assert action["name"] == "respond"
-    assert "reservation ID or user ID" in action["arguments"]["content"]
+    assert "couldn't complete that request" in action["arguments"]["content"]
+
+
+def test_build_fallback_action_does_not_reask_ids_when_context_is_sufficient():
+    action = build_fallback_action(
+        "Please cancel this reservation.",
+        context_text=(
+            "user_id: marco_polo_123\n"
+            "reservation_id: HXDUBJ\n"
+            "Please cancel reservation HXDUBJ for user marco_polo_123."
+        ),
+    )
+    assert action == {
+        "name": "respond",
+        "arguments": {"content": "I'm sorry, I couldn't complete that request right now."},
+    }
 
 
 def test_extract_allowed_tools_reads_exact_tool_block():
@@ -211,6 +251,162 @@ def test_extract_allowed_tools_reads_exact_tool_block():
     }
 
 
+def test_extract_allowed_tools_from_tau2_prompt_reads_function_names():
+    tau2_prompt = """
+    Policy...
+    Here's a list of tools you can use (you can use at most one tool at a time):
+    [
+      {"type":"function","function":{"name":"yara_garcia_123","description":"x"}}
+    ]
+    Return JSON.
+    """
+    assert extract_allowed_tools_from_tau2_prompt(tau2_prompt) == {"yara_garcia_123"}
+
+
+def test_extract_allowed_tools_from_tau2_prompt_handles_multiline_json():
+    tau2_prompt = """
+    Here's a list of tools you can use (you can use at most one tool at a time):
+    [
+      {
+        "type": "function",
+        "function": {
+          "name": "tool_one",
+          "description": "foo",
+          "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "tool_two",
+          "description": "bar",
+          "parameters": {"type": "object", "properties": {"id": {"type": "string"}}}
+        }
+      }
+    ]
+    """
+    assert extract_allowed_tools_from_tau2_prompt(tau2_prompt) == {"tool_one", "tool_two"}
+
+
+def test_extract_allowed_tools_from_green_agent_first_message_single_request():
+    green_message = """
+    domain_policy:
+    - follow policy
+    Here's a list of tools you can use (you can use at most one tool at a time):
+    [
+      {
+        "type": "function",
+        "function": {
+          "name": "yara_garcia_123",
+          "description": "Lookup reservation",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "reservation_id": {"type": "string"}
+            },
+            "required": ["reservation_id"]
+          }
+        }
+      }
+    ]
+
+    Synthetic action:
+    {"name":"respond","arguments":{"content":"..."}}
+    Return strict JSON with fields "name" and "arguments".
+
+    user: Please check reservation HXDUBJ
+    """
+    assert extract_allowed_tools_from_tau2_prompt(green_message) == {"yara_garcia_123"}
+
+
+def test_extract_allowed_tools_from_green_agent_message_multihop_keeps_first_turn_tools(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    agent = Agent()
+    first_green_message = """
+    domain_policy:
+    - follow policy
+    Here's a list of tools you can use (you can use at most one tool at a time):
+    [
+      {
+        "type": "function",
+        "function": {
+          "name": "yara_garcia_123",
+          "description": "Lookup reservation",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "reservation_id": {"type": "string"}
+            },
+            "required": ["reservation_id"]
+          }
+        }
+      }
+    ]
+    Return strict JSON with fields "name" and "arguments".
+    user: Please check reservation HXDUBJ
+    """
+    agent._store_user_turn(first_green_message)
+    assert agent.allowed_tools == {"yara_garcia_123"}
+
+    agent._store_user_turn("User: still waiting, please continue with HXDUBJ.")
+    agent.current_input_text = "User: please run the same check for HXDUBJ."
+
+    def fake_call_model(_: list[dict[str, str]]) -> str:
+        return '{"name":"yara_garcia_123","arguments":{"reservation_id":"HXDUBJ"}}'
+
+    monkeypatch.setattr(agent, "_call_model", fake_call_model)
+
+    action = agent._generate_action()
+    assert action == {
+        "name": "yara_garcia_123",
+        "arguments": {"reservation_id": "HXDUBJ"},
+    }
+
+
+def test_generate_action_returns_generic_fallback_when_allowed_tools_empty_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    agent = Agent()
+    agent.initial_prompt = "first turn without parseable tools"
+    agent.allowed_tools = set()
+    agent.current_input_text = "Please check reservation HXDUBJ."
+
+    def fake_call_model(_: list[dict[str, str]]) -> str:
+        return '{"name":"made_up_tool","arguments":{"reservation_id":"HXDUBJ"}}'
+
+    monkeypatch.setattr(agent, "_call_model", fake_call_model)
+
+    action = agent._generate_action()
+
+    assert action == {
+        "name": "respond",
+        "arguments": {"content": "I'm sorry, I couldn't complete that request right now."},
+    }
+
+
+def test_generate_action_skips_tool_validation_when_empty_toolset_debug_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("AGENT_ALLOW_EMPTY_TOOLSET_DEBUG", "1")
+    agent = Agent()
+    agent.initial_prompt = "first turn without parseable tools"
+    agent.allowed_tools = set()
+    agent.current_input_text = "Please check reservation HXDUBJ."
+
+    def fake_call_model(_: list[dict[str, str]]) -> str:
+        return '{"name":"made_up_tool","arguments":{"reservation_id":"HXDUBJ"}}'
+
+    monkeypatch.setattr(agent, "_call_model", fake_call_model)
+
+    action = agent._generate_action()
+
+    assert action == {
+        "name": "made_up_tool",
+        "arguments": {"reservation_id": "HXDUBJ"},
+    }
+
+
 def test_policy_allows_handoff_detects_explicit_transfer_language():
     prompt = "Policy: transfer to a human agent when the user requests legal escalation."
     assert policy_allows_handoff(prompt) is True
@@ -226,7 +422,7 @@ def test_is_disallowed_respond_content_rejects_fake_incapability_with_tools():
 
 
 def test_is_disallowed_respond_content_rejects_broad_clarify_with_identifier():
-    assert is_disallowed_respond_content(
+    assert not is_disallowed_respond_content(
         "Could you please clarify your request?",
         initial_prompt="Available tools are listed below.",
         allowed_tools={"cancel_reservation"},
@@ -362,7 +558,7 @@ def test_generate_action_returns_safe_respond_for_invalid_json(monkeypatch: pyte
 
     assert call_count["count"] == 1
     assert action["name"] == "respond"
-    assert "EHGLP3" in action["arguments"]["content"]
+    assert "couldn't complete that request" in action["arguments"]["content"]
 
 
 def test_generate_action_returns_safe_respond_for_invalid_tool(monkeypatch: pytest.MonkeyPatch):
@@ -387,7 +583,7 @@ def test_generate_action_returns_safe_respond_for_invalid_tool(monkeypatch: pyte
 
     assert call_count["count"] == 1
     assert action["name"] == "respond"
-    assert "EHGLP3" in action["arguments"]["content"]
+    assert "couldn't complete that request" in action["arguments"]["content"]
 
 
 def test_generate_action_uses_single_model_call_on_happy_path(monkeypatch: pytest.MonkeyPatch):
@@ -440,7 +636,7 @@ def test_generate_action_rejects_handoff_respond_when_policy_does_not_allow_it(
 
     assert call_count["count"] == 1
     assert action["name"] == "respond"
-    assert "EHGLP3" in action["arguments"]["content"]
+    assert "couldn't complete that request" in action["arguments"]["content"]
 
 
 def test_generate_action_allows_handoff_when_policy_explicitly_requires_it(
@@ -486,8 +682,10 @@ def test_generate_action_rejects_fake_incapability_claim_when_tools_exist(
 
     action = agent._generate_action()
 
-    assert action["name"] == "respond"
-    assert "EHGLP3" in action["arguments"]["content"]
+    assert action == {
+        "name": "respond",
+        "arguments": {"content": "I'm sorry, I couldn't complete that request right now."},
+    }
 
 
 def test_generate_action_rejects_broad_clarify_when_identifier_already_present(
@@ -508,8 +706,10 @@ def test_generate_action_rejects_broad_clarify_when_identifier_already_present(
 
     action = agent._generate_action()
 
-    assert action["name"] == "respond"
-    assert "EHGLP3" in action["arguments"]["content"]
+    assert action == {
+        "name": "respond",
+        "arguments": {"content": "Could you please clarify your request?"},
+    }
 
 
 def test_resolve_provider_config_for_openai_prefix(monkeypatch: pytest.MonkeyPatch):
