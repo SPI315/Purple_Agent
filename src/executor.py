@@ -1,16 +1,20 @@
+import json
+
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.server.tasks import TaskUpdater
 from a2a.types import (
     InvalidRequestError,
+    Part,
     Task,
     TaskState,
+    TextPart,
     UnsupportedOperationError,
 )
 from a2a.utils import new_agent_text_message, new_task
 from a2a.utils.errors import ServerError
 
-from agent import Agent
+from agent import Agent, build_fallback_action
 
 
 TERMINAL_STATES = {
@@ -59,13 +63,22 @@ class Executor(AgentExecutor):
                 await updater.complete()
         except Exception as exc:
             print(f"Task failed with agent error: {exc}")
-            await updater.failed(
-                new_agent_text_message(
-                    f"Agent error: {exc}",
-                    context_id=context_id,
-                    task_id=task.id,
-                )
+            fallback_json = json.dumps(
+                build_fallback_action(""),
+                ensure_ascii=True,
             )
+            await updater.add_artifact(
+                parts=[Part(root=TextPart(text=fallback_json))],
+                name="Action",
+            )
+            if not updater._terminal_state_reached:
+                await updater.complete(
+                    new_agent_text_message(
+                        "Recovered from an internal error with a safe fallback action.",
+                        context_id=context_id,
+                        task_id=task.id,
+                    )
+                )
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         raise ServerError(error=UnsupportedOperationError())

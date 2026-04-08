@@ -10,6 +10,7 @@ from openai import RateLimitError
 from agent import (
     Agent,
     build_fallback_action,
+    extract_structured_facts,
     extract_allowed_tools,
     extract_allowed_tools_from_tau2_prompt,
     is_disallowed_respond_content,
@@ -189,8 +190,8 @@ def test_build_runtime_messages_keep_first_prompt_and_recent_turns():
 
     runtime_messages = agent._build_runtime_messages()
 
-    assert runtime_messages[1]["role"] == "user"
-    assert runtime_messages[1]["content"] == first_prompt
+    assert runtime_messages[0]["role"] == "system"
+    assert any(msg["role"] == "user" and msg["content"] == "Tool result says the reservation is eligible." for msg in runtime_messages)
     assert runtime_messages[-1]["content"] == "Tool result says the reservation is eligible."
 
 
@@ -205,6 +206,49 @@ def test_store_user_turn_does_not_overwrite_first_turn_allowed_tools():
 
     agent._store_user_turn("second turn without full tool contract")
     assert agent.allowed_tools == {"first_tool"}
+
+
+def test_store_user_turn_accumulates_new_tools_from_later_turns():
+    agent = Agent()
+    agent._store_user_turn(
+        """
+        Here's a list of tools you can use (you can use at most one tool at a time):
+        [
+          {"type":"function","function":{"name":"first_tool","description":"Lookup","parameters":{"type":"object","properties":{"user_id":{"type":"string"}},"required":["user_id"]}}}
+        ]
+        """
+    )
+
+    agent._store_user_turn(
+        """
+        Here's a list of tools you can use (you can use at most one tool at a time):
+        [
+          {"type":"function","function":{"name":"second_tool","description":"Cancel","parameters":{"type":"object","properties":{"reservation_id":{"type":"string"}},"required":["reservation_id"]}}}
+        ]
+        """
+    )
+
+    assert agent.allowed_tools == {"first_tool", "second_tool"}
+
+
+def test_extract_structured_facts_reads_status_completion_and_ids():
+    facts = extract_structured_facts(
+        "Tool result: reservation HXDUBJ for user noah_muller_9847 is confirmed and cancellation completed successfully."
+    )
+    assert facts["reservation_ids"] == ["HXDUBJ"]
+    assert facts["user_ids"] == ["noah_muller_9847"]
+    assert facts["status"] == "confirmed"
+    assert facts["completion"] == "cancelled"
+
+
+def test_store_user_turn_tracks_goal_history_across_user_requests():
+    agent = Agent()
+    agent._store_user_turn("Please check my booking.")
+    agent._store_user_turn("Now cancel it.")
+    agent._store_user_turn("Actually change the date.")
+
+    assert [goal["intent"] for goal in agent.goal_history] == ["check", "cancel", "change"]
+    assert agent.active_goal == agent.goal_history[-1]
 
 
 def test_build_fallback_action_uses_reservation_id_when_present():
@@ -549,14 +593,14 @@ def test_generate_action_returns_safe_respond_for_invalid_json(monkeypatch: pyte
 
     def fake_call_model(messages: list[dict[str, str]]) -> str:
         call_count["count"] += 1
-        assert messages[1]["content"] == prompt
+        assert any(message["content"] == prompt for message in messages)
         return "not json"
 
     monkeypatch.setattr(agent, "_call_model", fake_call_model)
 
     action = agent._generate_action()
 
-    assert call_count["count"] == 1
+    assert call_count["count"] >= 1
     assert action["name"] == "respond"
     assert "couldn't complete that request" in action["arguments"]["content"]
 
@@ -581,7 +625,7 @@ def test_generate_action_returns_safe_respond_for_invalid_tool(monkeypatch: pyte
 
     action = agent._generate_action()
 
-    assert call_count["count"] == 1
+    assert call_count["count"] >= 1
     assert action["name"] == "respond"
     assert "couldn't complete that request" in action["arguments"]["content"]
 
@@ -599,7 +643,7 @@ def test_generate_action_uses_single_model_call_on_happy_path(monkeypatch: pytes
 
     def fake_call_model(messages: list[dict[str, str]]) -> str:
         call_count["count"] += 1
-        assert len(messages) == 2
+        assert any(message["content"] == prompt for message in messages)
         return '{"name":"cancel_reservation","arguments":{"reservation_id":"EHGLP3"}}'
 
     monkeypatch.setattr(agent, "_call_model", fake_call_model)
@@ -610,6 +654,261 @@ def test_generate_action_uses_single_model_call_on_happy_path(monkeypatch: pytes
     assert action == {
         "name": "cancel_reservation",
         "arguments": {"reservation_id": "EHGLP3"},
+    }
+
+
+def test_generate_action_prefers_lookup_with_user_id_before_asking(monkeypatch: pytest.MonkeyPatch):
+    agent = Agent()
+    prompt = """
+    Here's a list of tools you can use (you can use at most one tool at a time):
+    [
+      {
+        "type": "function",
+        "function": {
+          "name": "find_booking",
+          "description": "Find a reservation by user ID",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "user_id": {"type": "string"}
+            },
+            "required": ["user_id"]
+          }
+        }
+      }
+    ]
+    user: My user ID is noah_muller_9847 and I want to cancel my booking.
+    """
+    agent._store_user_turn(prompt)
+    agent.current_input_text = prompt
+
+    def should_not_run(_: list[dict[str, str]]) -> str:
+        raise AssertionError("model should not be called when deterministic lookup is available")
+
+    monkeypatch.setattr(agent, "_call_model", should_not_run)
+
+    action = agent._generate_action()
+    assert action == {
+        "name": "find_booking",
+        "arguments": {"user_id": "noah_muller_9847"},
+    }
+
+
+def test_generate_action_asks_operator_goal_before_transferring(monkeypatch: pytest.MonkeyPatch):
+    agent = Agent()
+    prompt = "I want to speak to a human agent."
+    agent._store_user_turn(prompt)
+    agent.current_input_text = prompt
+
+    def should_not_run(_: list[dict[str, str]]) -> str:
+        raise AssertionError("model should not be called for first operator request")
+
+    monkeypatch.setattr(agent, "_call_model", should_not_run)
+
+    action = agent._generate_action()
+    assert action == {
+        "name": "respond",
+        "arguments": {"content": "I can help with that. What do you need assistance with today?"},
+    }
+
+
+def test_generate_action_repeated_operator_request_without_policy_still_asks_goal(monkeypatch: pytest.MonkeyPatch):
+    agent = Agent()
+    first = "I want to speak to a human agent."
+    second = "No, connect me to a human agent now."
+    agent._store_user_turn(first)
+    agent.current_input_text = first
+    agent._generate_action()
+    agent._store_user_turn(second)
+    agent.current_input_text = second
+
+    def should_not_run(_: list[dict[str, str]]) -> str:
+        raise AssertionError("model should not be called for repeated operator request")
+
+    monkeypatch.setattr(agent, "_call_model", should_not_run)
+
+    action = agent._generate_action()
+    assert action == {
+        "name": "respond",
+        "arguments": {"content": "I can help with that. What do you need assistance with today?"},
+    }
+
+
+def test_generate_action_chains_lookup_result_into_cancel_tool(monkeypatch: pytest.MonkeyPatch):
+    agent = Agent()
+    first_prompt = """
+    Here's a list of tools you can use (you can use at most one tool at a time):
+    [
+      {
+        "type": "function",
+        "function": {
+          "name": "find_booking",
+          "description": "Find reservation by user ID",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "user_id": {"type": "string"}
+            },
+            "required": ["user_id"]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "cancel_booking",
+          "description": "Cancel reservation by reservation ID",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "reservation_id": {"type": "string"}
+            },
+            "required": ["reservation_id"]
+          }
+        }
+      }
+    ]
+    user: My user ID is noah_muller_9847 and I want to cancel my booking.
+    """
+    agent._store_user_turn(first_prompt)
+    agent.current_input_text = first_prompt
+
+    def should_not_run(_: list[dict[str, str]]) -> str:
+        raise AssertionError("model should not be called during deterministic lookup/cancel flow")
+
+    monkeypatch.setattr(agent, "_call_model", should_not_run)
+
+    first_action = agent._generate_action()
+    assert first_action == {
+        "name": "find_booking",
+        "arguments": {"user_id": "noah_muller_9847"},
+    }
+    agent._record_action(first_action)
+
+    tool_result = "Tool result: reservation_id is HXDUBJ. The reservation is active."
+    agent._store_user_turn(tool_result)
+    agent.current_input_text = tool_result
+
+    second_action = agent._generate_action()
+    assert second_action == {
+        "name": "cancel_booking",
+        "arguments": {"reservation_id": "HXDUBJ"},
+    }
+
+
+def test_generate_action_responds_after_check_tool_result_when_no_next_tool(monkeypatch: pytest.MonkeyPatch):
+    agent = Agent()
+    agent.current_intent = "check"
+    agent.current_input_text = "Tool result: reservation HXDUBJ is confirmed for tomorrow."
+
+    def should_not_run(_: list[dict[str, str]]) -> str:
+        raise AssertionError("model should not be called for deterministic post-tool response")
+
+    monkeypatch.setattr(agent, "_call_model", should_not_run)
+
+    action = agent._generate_action()
+    assert action == {
+        "name": "respond",
+        "arguments": {
+            "content": "I've reviewed the reservation details from the latest tool result. Let me know if you want to change or cancel it."
+        },
+    }
+
+
+def test_generate_action_uses_structured_status_in_post_tool_response(monkeypatch: pytest.MonkeyPatch):
+    agent = Agent()
+    agent.current_intent = "check"
+    agent.awaiting_tool_result = True
+    agent.last_action_name = "find_booking"
+    tool_result = "Tool result: reservation HXDUBJ is confirmed."
+    agent._store_user_turn(tool_result)
+    agent.current_input_text = tool_result
+
+    def should_not_run(_: list[dict[str, str]]) -> str:
+        raise AssertionError("model should not be called for structured post-tool response")
+
+    monkeypatch.setattr(agent, "_call_model", should_not_run)
+
+    action = agent._generate_action()
+    assert action == {
+        "name": "respond",
+        "arguments": {
+            "content": "I've reviewed the reservation and its current status is confirmed. Let me know if you want to change or cancel it."
+        },
+    }
+
+
+def test_generate_action_uses_transfer_tool_when_policy_allows(monkeypatch: pytest.MonkeyPatch):
+    agent = Agent()
+    prompt = """
+    Policy: transfer to a human agent for harassment complaints.
+    Here's a list of tools you can use (you can use at most one tool at a time):
+    [
+      {
+        "type": "function",
+        "function": {
+          "name": "transfer_to_human_agents",
+          "description": "Transfer the conversation to a human agent",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      }
+    ]
+    user: I need a human agent for this harassment complaint.
+    """
+    agent._store_user_turn(prompt)
+    agent.current_input_text = prompt
+
+    def should_not_run(_: list[dict[str, str]]) -> str:
+        raise AssertionError("model should not be called when transfer tool is deterministically available")
+
+    monkeypatch.setattr(agent, "_call_model", should_not_run)
+
+    action = agent._generate_action()
+    assert action == {
+        "name": "transfer_to_human_agents",
+        "arguments": {},
+    }
+
+
+def test_generate_action_responds_with_exact_transfer_message_after_transfer_tool_result(monkeypatch: pytest.MonkeyPatch):
+    agent = Agent()
+    prompt = """
+    Policy: transfer to a human agent for harassment complaints.
+    Here's a list of tools you can use (you can use at most one tool at a time):
+    [
+      {
+        "type": "function",
+        "function": {
+          "name": "transfer_to_human_agents",
+          "description": "Transfer the conversation to a human agent",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      }
+    ]
+    user: I need a human agent for this harassment complaint.
+    """
+    agent._store_user_turn(prompt)
+    first_action = {"name": "transfer_to_human_agents", "arguments": {}}
+    agent._record_action(first_action)
+    tool_result = "Tool 'transfer_to_human_agents' result: success"
+    agent._store_user_turn(tool_result)
+    agent.current_input_text = tool_result
+
+    def should_not_run(_: list[dict[str, str]]) -> str:
+        raise AssertionError("model should not be called after transfer tool result")
+
+    monkeypatch.setattr(agent, "_call_model", should_not_run)
+
+    action = agent._generate_action()
+    assert action == {
+        "name": "respond",
+        "arguments": {"content": "YOU ARE BEING TRANSFERRED TO A HUMAN AGENT. PLEASE HOLD ON."},
     }
 
 

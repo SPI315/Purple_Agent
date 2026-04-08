@@ -70,6 +70,37 @@ FALLBACK_ACTION = {
 }
 USER_ID_PATTERN = re.compile(r"\b[a-z]+(?:_[a-z]+)+_\d{3,}\b", re.IGNORECASE)
 RESERVATION_ID_PATTERN = re.compile(r"\b[A-Z0-9]{6}\b")
+OPERATOR_REQUEST_PHRASES = (
+    "operator",
+    "human",
+    "representative",
+    "agent",
+    "someone real",
+    "person",
+)
+INTENT_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("cancel", ("cancel", "refund", "void")),
+    ("change", ("change", "modify", "move", "reschedule", "switch", "update")),
+    ("check", ("check", "lookup", "look up", "status", "details", "find", "see")),
+    ("book", ("book", "reserve", "purchase", "buy")),
+    ("operator", ("operator", "human", "representative", "person", "agent")),
+)
+TOOL_RESULT_MARKERS = (
+    "tool result",
+    "result:",
+    "env:",
+    "reservation data",
+    "flight data",
+    "lookup result",
+    "search result",
+)
+TRANSFER_TOOL_TOKENS = (
+    "transfer_to_human_agents",
+    "transfer",
+    "human",
+    "escalate",
+)
+TRANSFER_HOLD_MESSAGE = "YOU ARE BEING TRANSFERRED TO A HUMAN AGENT. PLEASE HOLD ON."
 
 
 def load_system_prompt() -> str:
@@ -155,6 +186,14 @@ def build_fallback_action(
         "name": "respond",
         "arguments": {"content": FALLBACK_ACTION["arguments"]["content"]},
     }
+
+
+def _dedupe_append(target: list[str], values: list[str]) -> None:
+    existing = set(target)
+    for value in values:
+        if value not in existing:
+            target.append(value)
+            existing.add(value)
 
 
 def _extract_tool_objects(tool_block: str) -> list[dict[str, Any]]:
@@ -286,11 +325,100 @@ def extract_allowed_tools(input_text: str) -> set[str]:
     return allowed_tools
 
 
+def extract_tool_specs(input_text: str) -> dict[str, dict[str, Any]]:
+    tau2_tools = extract_allowed_tools_from_tau2_prompt(input_text)
+    specs: dict[str, dict[str, Any]] = {}
+    if tau2_tools:
+        anchor_start = input_text.find(TAU2_TOOLS_ANCHOR)
+        array_start = input_text.find("[", anchor_start)
+        depth = 0
+        in_string = False
+        escaped = False
+        array_end = -1
+        for index in range(array_start, len(input_text)):
+            char = input_text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                    continue
+                if char == "\\":
+                    escaped = True
+                    continue
+                if char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+                continue
+            if char == "[":
+                depth += 1
+                continue
+            if char == "]":
+                depth -= 1
+                if depth == 0:
+                    array_end = index
+                    break
+        if array_start != -1 and array_end != -1:
+            try:
+                parsed = json.loads(input_text[array_start : array_end + 1])
+            except json.JSONDecodeError:
+                parsed = []
+            if isinstance(parsed, list):
+                for tool in parsed:
+                    if not isinstance(tool, dict):
+                        continue
+                    function_obj = tool.get("function")
+                    if not isinstance(function_obj, dict):
+                        continue
+                    name = function_obj.get("name")
+                    if not isinstance(name, str) or not name or name == "respond":
+                        continue
+                    parameters = function_obj.get("parameters")
+                    if not isinstance(parameters, dict):
+                        parameters = {}
+                    specs[name] = {
+                        "name": name,
+                        "description": function_obj.get("description", ""),
+                        "parameters": parameters,
+                    }
+                if specs:
+                    return specs
+
+    lowered = input_text.lower()
+    start_index = -1
+    for header in TOOL_SECTION_HEADERS:
+        start_index = lowered.find(header)
+        if start_index != -1:
+            start_index += len(header)
+            break
+
+    if start_index == -1:
+        return {}
+
+    tool_block = input_text[start_index:]
+    for tool_object in _extract_tool_objects(tool_block):
+        name = tool_object.get("name")
+        if not isinstance(name, str) or not name or name == "respond":
+            continue
+        parameters = tool_object.get("parameters")
+        if not isinstance(parameters, dict):
+            parameters = {}
+        specs[name] = {
+            "name": name,
+            "description": tool_object.get("description", ""),
+            "parameters": parameters,
+        }
+    return specs
+
+
 def policy_allows_handoff(prompt: str | None) -> bool:
     if not prompt:
         return False
     lowered = prompt.lower()
-    return any(phrase in lowered for phrase in HANDOFF_PHRASES)
+    policy_markers = ("policy", "rule", "instruction", "must", "should", "requires")
+    return any(marker in lowered for marker in policy_markers) and any(
+        phrase in lowered for phrase in HANDOFF_PHRASES
+    )
 
 
 def has_lookup_or_action_tools(allowed_tools: set[str] | None) -> bool:
@@ -316,6 +444,173 @@ def is_disallowed_respond_content(
         return True
 
     return False
+
+
+def extract_intent(text: str) -> str | None:
+    lowered = text.lower()
+    if any(phrase in lowered for phrase in ("most recent booking", "latest booking", "last booking", "most recent reservation")):
+        return "check"
+    for intent, keywords in INTENT_KEYWORDS:
+        if any(keyword in lowered for keyword in keywords):
+            return intent
+    return None
+
+
+def _tool_text(spec: dict[str, Any]) -> str:
+    parameters = spec.get("parameters")
+    properties = []
+    required = []
+    if isinstance(parameters, dict):
+        raw_properties = parameters.get("properties")
+        if isinstance(raw_properties, dict):
+            properties = list(raw_properties.keys())
+        raw_required = parameters.get("required")
+        if isinstance(raw_required, list):
+            required = [item for item in raw_required if isinstance(item, str)]
+    tokens = [spec.get("name", ""), spec.get("description", ""), " ".join(properties), " ".join(required)]
+    return " ".join(token for token in tokens if isinstance(token, str)).lower()
+
+
+def _tool_required_fields(spec: dict[str, Any]) -> list[str]:
+    parameters = spec.get("parameters")
+    if not isinstance(parameters, dict):
+        return []
+    required = parameters.get("required")
+    if not isinstance(required, list):
+        return []
+    return [item for item in required if isinstance(item, str)]
+
+
+def _tool_optional_fields(spec: dict[str, Any]) -> list[str]:
+    parameters = spec.get("parameters")
+    if not isinstance(parameters, dict):
+        return []
+    properties = parameters.get("properties")
+    if not isinstance(properties, dict):
+        return []
+    return [key for key in properties.keys() if isinstance(key, str)]
+
+
+def _is_recent_booking_request(text: str) -> bool:
+    lowered = text.lower()
+    return any(phrase in lowered for phrase in ("most recent booking", "latest booking", "last booking", "most recent reservation"))
+
+
+def _is_operator_request(text: str) -> bool:
+    lowered = text.lower()
+    return (
+        any(phrase in lowered for phrase in OPERATOR_REQUEST_PHRASES)
+        and any(phrase in lowered for phrase in ("want", "need", "speak", "talk", "connect", "transfer"))
+    )
+
+
+def _looks_like_tool_result(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in TOOL_RESULT_MARKERS)
+
+
+def _is_lookup_tool(spec: dict[str, Any]) -> bool:
+    text = _tool_text(spec)
+    return any(token in text for token in ("lookup", "search", "find", "list", "retrieve", "get", "recent", "latest"))
+
+
+def _is_action_tool(spec: dict[str, Any], intent: str | None) -> bool:
+    text = _tool_text(spec)
+    if intent == "cancel":
+        return any(token in text for token in ("cancel", "refund", "void"))
+    if intent == "change":
+        return any(token in text for token in ("change", "modify", "update", "reschedule"))
+    if intent == "book":
+        return any(token in text for token in ("book", "create", "purchase", "reserve"))
+    return False
+
+
+def _tool_uses_reservation_id(spec: dict[str, Any]) -> bool:
+    fields = _tool_optional_fields(spec) + _tool_required_fields(spec)
+    return any(any(token in field.lower() for token in ("reservation", "booking", "confirmation")) for field in fields)
+
+
+def _tool_uses_user_id(spec: dict[str, Any]) -> bool:
+    fields = _tool_optional_fields(spec) + _tool_required_fields(spec)
+    return any(any(token in field.lower() for token in ("user", "customer", "account", "profile")) for field in fields)
+
+
+def _tool_result_indicates_not_found(text: str) -> bool:
+    lowered = text.lower()
+    return any(token in lowered for token in ("not found", "no reservation", "no booking", "none found", "unable to locate"))
+
+
+def _tool_result_indicates_completion(text: str) -> bool:
+    lowered = text.lower()
+    return any(token in lowered for token in ("success", "completed", "cancelled", "canceled", "confirmed", "updated", "booked"))
+
+
+def _is_transfer_tool(spec: dict[str, Any]) -> bool:
+    text = _tool_text(spec)
+    return any(token in text for token in TRANSFER_TOOL_TOKENS)
+
+
+def extract_structured_facts(text: str) -> dict[str, Any]:
+    lowered = text.lower()
+    identifiers = extract_identifiers(text)
+    status: str | None = None
+    for candidate in ("active", "confirmed", "cancelled", "canceled", "pending", "eligible", "ineligible"):
+        if re.search(rf"\b{re.escape(candidate)}\b", lowered):
+            status = candidate
+            break
+
+    completion: str | None = None
+    if any(token in lowered for token in ("cancelled", "canceled", "cancellation complete")):
+        completion = "cancelled"
+    elif any(token in lowered for token in ("updated", "change complete", "rescheduled")):
+        completion = "updated"
+    elif any(token in lowered for token in ("booked", "booking complete", "reservation created")):
+        completion = "booked"
+
+    facts: dict[str, Any] = {
+        "reservation_ids": identifiers["reservation_ids"],
+        "user_ids": identifiers["user_ids"],
+        "status": status,
+        "not_found": _tool_result_indicates_not_found(text),
+        "completion": completion,
+        "latest_requested": _is_recent_booking_request(text),
+    }
+
+    if "eligible" in lowered:
+        facts["eligibility"] = "eligible"
+    elif "ineligible" in lowered or "not eligible" in lowered:
+        facts["eligibility"] = "ineligible"
+
+    return facts
+
+
+def _merge_identifier_state(
+    target: dict[str, list[str]],
+    new_values: dict[str, list[str]],
+) -> None:
+    _dedupe_append(target["reservation_ids"], new_values.get("reservation_ids", []))
+    _dedupe_append(target["user_ids"], new_values.get("user_ids", []))
+
+
+def extract_user_focus_text(text: str) -> str:
+    user_lines = re.findall(r"(?:^|\n)\s*user:\s*(.+)", text, flags=re.IGNORECASE)
+    if user_lines:
+        return "\n".join(user_lines)
+
+    lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        lowered = stripped.lower()
+        if lowered.startswith("policy:") or lowered.startswith("available tools:"):
+            continue
+        if stripped.startswith("{") or stripped.startswith("[") or stripped.startswith("]"):
+            continue
+        if '"name"' in stripped or '"parameters"' in stripped or '"function"' in stripped:
+            continue
+        lines.append(stripped)
+    return "\n".join(lines)
 
 
 def split_provider_model(model: str) -> tuple[str | None, str]:
@@ -419,9 +714,30 @@ class Agent:
                 max_retries=1,
             )
         self.initial_prompt: str | None = None
+        self.current_snapshot: str | None = None
         self.allowed_tools: set[str] | None = None
+        self.tool_specs: dict[str, dict[str, Any]] = {}
         self.turn_history: list[dict[str, str]] = []
         self.current_input_text = ""
+        self.intent_history: list[str] = []
+        self.current_intent: str | None = None
+        self.goal_history: list[dict[str, str]] = []
+        self.active_goal: dict[str, str] | None = None
+        self.known_identifiers = {
+            "reservation_ids": [],
+            "user_ids": [],
+        }
+        self.tool_journal: list[dict[str, str | None]] = []
+        self.structured_facts: dict[str, Any] = {
+            "status": None,
+            "eligibility": None,
+            "not_found": False,
+            "completion": None,
+            "latest_requested": False,
+        }
+        self.last_action_name: str | None = None
+        self.awaiting_tool_result = False
+        self.operator_request_count = 0
 
     async def run(self, message: Message, updater: TaskUpdater) -> None:
         input_text = get_message_text(message)
@@ -449,16 +765,58 @@ class Agent:
         action_json = json.dumps(action, ensure_ascii=True)
         self.turn_history.append({"role": "assistant", "content": action_json})
         self._trim_turn_history()
+        self._record_action(action)
 
         await updater.add_artifact(
             parts=[Part(root=TextPart(text=action_json))],
             name="Action",
         )
 
+    def _record_action(self, action: dict[str, Any]) -> None:
+        action_name = action.get("name")
+        if not isinstance(action_name, str):
+            return
+        self.last_action_name = action_name
+        if action_name == "respond":
+            self.awaiting_tool_result = False
+            return
+        self.awaiting_tool_result = True
+        self.tool_journal.append({"name": action_name, "result_summary": None})
+
+    def _update_goal_state(self, *, intent: str, source_text: str) -> None:
+        goal_summary = summarize_message(source_text)
+        if self.active_goal and self.active_goal.get("intent") == intent:
+            self.active_goal["summary"] = goal_summary
+            return
+        goal = {"intent": intent, "summary": goal_summary}
+        self.goal_history.append(goal)
+        self.active_goal = goal
+
+    def _update_structured_facts(self, facts: dict[str, Any]) -> None:
+        reservation_ids = facts.get("reservation_ids")
+        if isinstance(reservation_ids, list):
+            _dedupe_append(self.known_identifiers["reservation_ids"], [item for item in reservation_ids if isinstance(item, str)])
+        user_ids = facts.get("user_ids")
+        if isinstance(user_ids, list):
+            _dedupe_append(self.known_identifiers["user_ids"], [item for item in user_ids if isinstance(item, str)])
+
+        for key in ("status", "eligibility", "completion"):
+            value = facts.get(key)
+            if isinstance(value, str) and value:
+                self.structured_facts[key] = value
+
+        if facts.get("not_found"):
+            self.structured_facts["not_found"] = True
+        if facts.get("latest_requested"):
+            self.structured_facts["latest_requested"] = True
+
     def _store_user_turn(self, input_text: str) -> None:
+        self.current_snapshot = input_text
+        extracted_tools = extract_tool_specs(input_text)
         if self.initial_prompt is None:
             self.initial_prompt = input_text
-            self.allowed_tools = extract_allowed_tools(input_text)
+            self.allowed_tools = set(extracted_tools) or extract_allowed_tools(input_text)
+            self.tool_specs.update(extracted_tools)
             self.logger.info(
                 "Initialized context with %s allowed runtime tools.",
                 len(self.allowed_tools),
@@ -467,16 +825,52 @@ class Agent:
                 self.logger.error(
                     "Runtime tools extraction failed: allowed_tools is empty on first turn"
                 )
-            return
+        else:
+            if self.allowed_tools is None:
+                self.allowed_tools = set()
+            self.allowed_tools.update(extracted_tools.keys())
+            self.allowed_tools.update(extract_allowed_tools(input_text))
+            self.tool_specs.update(extracted_tools)
+            self.turn_history.append({"role": "user", "content": input_text})
+            self._trim_turn_history()
 
-        self.turn_history.append({"role": "user", "content": input_text})
-        self._trim_turn_history()
+        identifiers = extract_identifiers(input_text)
+        _merge_identifier_state(self.known_identifiers, identifiers)
+
+        user_focus_text = extract_user_focus_text(input_text)
+        intent = extract_intent(user_focus_text)
+        if intent:
+            if not self.intent_history or self.intent_history[-1] != intent:
+                self.intent_history.append(intent)
+            self.current_intent = intent
+            self._update_goal_state(intent=intent, source_text=user_focus_text)
+
+        if _is_operator_request(user_focus_text):
+            self.operator_request_count += 1
+
+        if self.awaiting_tool_result and self.last_action_name and _looks_like_tool_result(input_text):
+            facts = extract_structured_facts(input_text)
+            self._update_structured_facts(facts)
+            if self.tool_journal and self.tool_journal[-1].get("name") == self.last_action_name:
+                self.tool_journal[-1]["result_summary"] = summarize_message(input_text)
+            else:
+                self.tool_journal.append(
+                    {
+                        "name": self.last_action_name,
+                        "result_summary": summarize_message(input_text),
+                    }
+                )
+            self.awaiting_tool_result = False
 
     def _trim_turn_history(self) -> None:
         if len(self.turn_history) > MAX_RECENT_TURNS:
             self.turn_history = self.turn_history[-MAX_RECENT_TURNS:]
 
     def _generate_action(self) -> dict[str, Any]:
+        deterministic_action = self._choose_deterministic_action()
+        if deterministic_action is not None:
+            return deterministic_action
+
         runtime_messages = self._build_runtime_messages()
         try:
             raw_output = self._call_model(runtime_messages)
@@ -541,10 +935,19 @@ class Agent:
                 sorted(list(self.allowed_tools or set()))[:20],
             )
             self.logger.debug("Primary raw output: %s", summarize_message(raw_output))
-            return build_fallback_action(
-                self.current_input_text,
-                context_text=self._build_context_text(),
-            )
+            repaired_output = self._repair_action(raw_output, validation_tools, str(exc))
+            if repaired_output is None:
+                return build_fallback_action(
+                    self.current_input_text,
+                    context_text=self._build_context_text(),
+                )
+            try:
+                action = parse_action(repaired_output, allowed_tools=validation_tools)
+            except ValueError:
+                return build_fallback_action(
+                    self.current_input_text,
+                    context_text=self._build_context_text(),
+                )
 
         if action["name"] == "respond":
             content = str(action["arguments"].get("content", ""))
@@ -563,6 +966,307 @@ class Agent:
                 )
 
         return action
+
+    def _repair_action(
+        self,
+        raw_output: str,
+        error_text: str,
+        validation_tools: set[str] | None,
+    ) -> str | None:
+        if self.model in {"mock", "test"}:
+            return None
+        repair_messages = self._build_runtime_messages()
+        repair_messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "Repair the previous assistant output. "
+                    "Return exactly one valid JSON action object with fields name and arguments. "
+                    "Use only runtime tool names already provided."
+                ),
+            }
+        )
+        repair_messages.append(
+            {
+                "role": "assistant",
+                "content": raw_output,
+            }
+        )
+        repair_messages.append(
+            {
+                "role": "user",
+                "content": f"Validation error: {error_text}",
+            }
+        )
+        try:
+            return self._call_model(repair_messages)
+        except (
+            APITimeoutError,
+            APIConnectionError,
+            APIError,
+            RateLimitError,
+            TimeoutError,
+            OSError,
+            ValueError,
+        ):
+            return None
+
+    def _choose_deterministic_action(self) -> dict[str, Any] | None:
+        effective_intent = self._effective_intent()
+        post_tool_action = self._handle_post_tool_result()
+        if post_tool_action is not None:
+            return post_tool_action
+
+        if _is_operator_request(self.current_input_text):
+            transfer_action = self._deterministic_transfer_action()
+            if transfer_action is not None:
+                return transfer_action
+            if not policy_allows_handoff(self.current_snapshot or self.initial_prompt):
+                return {
+                    "name": "respond",
+                    "arguments": {
+                        "content": "I can help with that. What do you need assistance with today?"
+                    },
+                }
+
+        tool_action = self._deterministic_tool_action()
+        if tool_action is not None:
+            return tool_action
+
+        if self.allowed_tools and effective_intent in {"cancel", "change", "check", "book"}:
+            missing_hint = self._build_missing_info_response()
+            if missing_hint is not None:
+                return missing_hint
+
+        return None
+
+    def _effective_intent(self) -> str | None:
+        if self.current_intent:
+            return self.current_intent
+        if self.active_goal and isinstance(self.active_goal.get("intent"), str):
+            return self.active_goal["intent"]
+        return None
+
+    def _deterministic_transfer_action(self) -> dict[str, Any] | None:
+        if not policy_allows_handoff(self.current_snapshot or self.initial_prompt):
+            return None
+
+        for spec in self.tool_specs.values():
+            if not _is_transfer_tool(spec):
+                continue
+            arguments = self._build_tool_arguments(spec, recent_request=False)
+            if arguments is None:
+                required_fields = _tool_required_fields(spec)
+                if required_fields:
+                    continue
+                arguments = {}
+            return {"name": spec["name"], "arguments": arguments}
+
+        return None
+
+    def _handle_post_tool_result(self) -> dict[str, Any] | None:
+        if not _looks_like_tool_result(self.current_input_text):
+            return None
+
+        effective_intent = self._effective_intent()
+
+        if self.last_action_name:
+            transfer_spec = self.tool_specs.get(self.last_action_name)
+            if transfer_spec and _is_transfer_tool(transfer_spec):
+                return {
+                    "name": "respond",
+                    "arguments": {
+                        "content": TRANSFER_HOLD_MESSAGE
+                    },
+                }
+
+        if self.structured_facts.get("not_found") or _tool_result_indicates_not_found(self.current_input_text):
+            if effective_intent in {"cancel", "change", "check"}:
+                return {
+                    "name": "respond",
+                    "arguments": {
+                        "content": "I couldn't find a matching reservation from the available information. Please share your reservation ID or user ID."
+                    },
+                }
+
+        next_action = self._deterministic_tool_action(prefer_actions=True)
+        if next_action is not None:
+            return next_action
+
+        if effective_intent == "check":
+            status = self.structured_facts.get("status")
+            if isinstance(status, str) and status:
+                return {
+                    "name": "respond",
+                    "arguments": {
+                        "content": f"I've reviewed the reservation and its current status is {status}. Let me know if you want to change or cancel it."
+                    },
+                }
+            return {
+                "name": "respond",
+                "arguments": {
+                    "content": "I've reviewed the reservation details from the latest tool result. Let me know if you want to change or cancel it."
+                },
+            }
+
+        if effective_intent == "cancel" and (
+            self.structured_facts.get("completion") == "cancelled"
+            or _tool_result_indicates_completion(self.current_input_text)
+        ):
+            return {
+                "name": "respond",
+                "arguments": {
+                    "content": "Your cancellation has been completed."
+                },
+            }
+
+        if effective_intent == "change" and (
+            self.structured_facts.get("completion") == "updated"
+            or _tool_result_indicates_completion(self.current_input_text)
+        ):
+            return {
+                "name": "respond",
+                "arguments": {
+                    "content": "Your reservation has been updated."
+                },
+            }
+
+        return None
+
+    def _deterministic_tool_action(self, *, prefer_actions: bool = False) -> dict[str, Any] | None:
+        if not self.tool_specs:
+            return None
+
+        recent_request = _is_recent_booking_request(self.current_input_text)
+        candidates: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
+        for name, spec in self.tool_specs.items():
+            score = self._score_tool(spec, prefer_actions=prefer_actions)
+            if score <= 0:
+                continue
+            arguments = self._build_tool_arguments(spec, recent_request=recent_request)
+            if arguments is None:
+                continue
+            candidates.append((score, spec, arguments))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        _, spec, arguments = candidates[0]
+        return {"name": spec["name"], "arguments": arguments}
+
+    def _score_tool(self, spec: dict[str, Any], *, prefer_actions: bool = False) -> int:
+        text = _tool_text(spec)
+        score = 0
+        is_lookup = _is_lookup_tool(spec)
+        effective_intent = self._effective_intent()
+        is_action = _is_action_tool(spec, effective_intent)
+        if effective_intent == "cancel":
+            if is_action:
+                score += 8
+            if is_lookup:
+                score += 2
+            if "reservation" in text or "booking" in text:
+                score += 3
+        elif effective_intent == "check":
+            if is_lookup:
+                score += 8
+            if "reservation" in text or "booking" in text or "flight" in text:
+                score += 3
+        elif effective_intent == "change":
+            if is_action:
+                score += 8
+            if is_lookup:
+                score += 2
+        elif effective_intent == "book":
+            if is_action:
+                score += 8
+
+        if _is_recent_booking_request(self.current_input_text) and any(
+            token in text for token in ("recent", "latest", "list", "search", "find")
+        ):
+            score += 6
+
+        if self.known_identifiers["reservation_ids"] and _tool_uses_reservation_id(spec):
+            score += 2
+        if self.known_identifiers["user_ids"] and _tool_uses_user_id(spec):
+            score += 2
+
+        if effective_intent in {"cancel", "change"}:
+            if self.known_identifiers["reservation_ids"] and is_action:
+                score += 7
+            if not self.known_identifiers["reservation_ids"] and is_lookup:
+                score += 5
+            if prefer_actions and is_action:
+                score += 6
+            if prefer_actions and is_lookup:
+                score -= 3
+
+        if effective_intent == "check" and is_lookup:
+            score += 2
+
+        if self.awaiting_tool_result and self.last_action_name == spec.get("name"):
+            score -= 10
+
+        return score
+
+    def _build_tool_arguments(
+        self,
+        spec: dict[str, Any],
+        *,
+        recent_request: bool,
+    ) -> dict[str, Any] | None:
+        fields = _tool_optional_fields(spec)
+        required_fields = _tool_required_fields(spec)
+        if not fields and not required_fields:
+            return None
+        arguments: dict[str, Any] = {}
+        for field in fields:
+            lowered = field.lower()
+            if any(token in lowered for token in ("reservation", "booking", "confirmation")):
+                if self.known_identifiers["reservation_ids"]:
+                    arguments[field] = self.known_identifiers["reservation_ids"][-1]
+            elif "user" in lowered or "customer" in lowered or "account" in lowered:
+                if self.known_identifiers["user_ids"]:
+                    arguments[field] = self.known_identifiers["user_ids"][-1]
+            elif recent_request and any(token in lowered for token in ("recent", "latest", "most_recent")):
+                arguments[field] = True
+            elif recent_request and "sort" in lowered:
+                arguments[field] = "desc"
+            elif recent_request and any(token in lowered for token in ("limit", "count", "top")):
+                arguments[field] = 1
+
+        if any(field not in arguments for field in required_fields):
+            return None
+        if not arguments and not recent_request:
+            return None
+
+        return arguments
+
+    def _build_missing_info_response(self) -> dict[str, Any] | None:
+        if self.tool_specs and self.known_identifiers["user_ids"] and not self.known_identifiers["reservation_ids"]:
+            for spec in self.tool_specs.values():
+                text = _tool_text(spec)
+                if any(token in text for token in ("lookup", "search", "find", "list", "recent", "reservation", "booking")):
+                    arguments = self._build_tool_arguments(spec, recent_request=_is_recent_booking_request(self.current_input_text))
+                    if arguments is not None:
+                        return {"name": spec["name"], "arguments": arguments}
+
+        if not self.known_identifiers["reservation_ids"] and not self.known_identifiers["user_ids"]:
+            return {
+                "name": "respond",
+                "arguments": {
+                    "content": "Please share your reservation ID or user ID so I can look this up."
+                },
+            }
+        if not self.known_identifiers["reservation_ids"] and not _is_recent_booking_request(self.current_input_text):
+            return {
+                "name": "respond",
+                "arguments": {
+                    "content": "Please share your reservation ID, or your user ID if you do not have the reservation ID."
+                },
+            }
+        return None
 
     def _call_model(self, messages: list[dict[str, str]]) -> str:
         if self.model in {"mock", "test"}:
@@ -628,11 +1332,55 @@ class Agent:
         return content
 
     def _build_runtime_messages(self) -> list[dict[str, str]]:
-        messages: list[dict[str, str]] = [
-            {"role": "system", "content": self.system_prompt}
+        messages: list[dict[str, str]] = [{"role": "system", "content": self.system_prompt}]
+        state_lines = [
+            f"Current intent: {self._effective_intent() or 'unknown'}",
+            f"Intent history: {', '.join(self.intent_history[-5:]) or 'none'}",
+            (
+                "Goal history: "
+                + " | ".join(
+                    f"{goal.get('intent', 'unknown')}: {goal.get('summary', '')}"
+                    for goal in self.goal_history[-5:]
+                )
+                if self.goal_history
+                else "Goal history: none"
+            ),
+            f"Known reservation IDs: {', '.join(self.known_identifiers['reservation_ids'][-3:]) or 'none'}",
+            f"Known user IDs: {', '.join(self.known_identifiers['user_ids'][-3:]) or 'none'}",
+            f"Structured status: {self.structured_facts.get('status') or 'unknown'}",
+            f"Structured eligibility: {self.structured_facts.get('eligibility') or 'unknown'}",
+            f"Structured completion: {self.structured_facts.get('completion') or 'none'}",
+            f"Structured not_found: {str(bool(self.structured_facts.get('not_found'))).lower()}",
+            f"Recent tool calls: {', '.join(entry.get('name') or '' for entry in self.tool_journal[-3:]) or 'none'}",
+            (
+                "Recent tool results: "
+                + " | ".join(
+                    (entry.get("result_summary") or "")
+                    for entry in self.tool_journal[-2:]
+                    if entry.get("result_summary")
+                )
+                if self.tool_journal
+                else "Recent tool results: none"
+            ),
+            (
+                "If the current message contains the result of a previous tool call and it resolves the request, "
+                "respond to the user instead of greeting again or repeating the same question."
+            ),
         ]
+        messages.append({"role": "system", "content": "\n".join(state_lines)})
         if self.initial_prompt is not None:
-            messages.append({"role": "user", "content": self.initial_prompt})
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "First task snapshot retained for long-term policy context. "
+                        "Do not rely on it when it conflicts with the latest user message.\n"
+                        f"First snapshot summary: {summarize_message(extract_user_focus_text(self.initial_prompt) or self.initial_prompt)}"
+                    ),
+                }
+            )
+        if self.current_snapshot is not None:
+            messages.append({"role": "user", "content": self.current_snapshot})
         messages.extend(self.turn_history[-MAX_RECENT_TURNS:])
         return messages
 
