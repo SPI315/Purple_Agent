@@ -70,6 +70,15 @@ FALLBACK_ACTION = {
 }
 USER_ID_PATTERN = re.compile(r"\b[a-z]+(?:_[a-z]+)+_\d{3,}\b", re.IGNORECASE)
 RESERVATION_ID_PATTERN = re.compile(r"\b[A-Z0-9]{6}\b")
+RESERVATION_ID_STOPWORDS = {
+    "ENTIRE",
+    "PLEASE",
+    "NUMBER",
+    "STATUS",
+    "RESULT",
+    "ACTIVE",
+    "ERROR",
+}
 OPERATOR_REQUEST_PHRASES = (
     "operator",
     "human",
@@ -163,7 +172,7 @@ def extract_identifiers(text: str) -> dict[str, list[str]]:
     for match in RESERVATION_ID_PATTERN.finditer(text):
         token = match.group(0)
         lowered = token.lower()
-        if lowered in {"json", "http", "text"}:
+        if lowered in {"json", "http", "text"} or token.upper() in RESERVATION_ID_STOPWORDS:
             continue
         reservation_ids.append(token)
 
@@ -506,7 +515,7 @@ def _is_operator_request(text: str) -> bool:
 
 def _looks_like_tool_result(text: str) -> bool:
     lowered = text.lower()
-    return any(marker in lowered for marker in TOOL_RESULT_MARKERS)
+    return any(marker in lowered for marker in TOOL_RESULT_MARKERS) or lowered.startswith("error:")
 
 
 def _is_lookup_tool(spec: dict[str, Any]) -> bool:
@@ -777,11 +786,48 @@ class Agent:
         if not isinstance(action_name, str):
             return
         self.last_action_name = action_name
+        arguments = action.get("arguments")
+        if isinstance(arguments, dict):
+            self._update_structured_facts(extract_structured_facts(json.dumps(arguments)))
+        inferred_intent = self._infer_intent_from_action(action)
+        if inferred_intent:
+            if not self.intent_history or self.intent_history[-1] != inferred_intent:
+                self.intent_history.append(inferred_intent)
+            self.current_intent = inferred_intent
+            self._update_goal_state(intent=inferred_intent, source_text=json.dumps(action, ensure_ascii=True))
         if action_name == "respond":
             self.awaiting_tool_result = False
             return
         self.awaiting_tool_result = True
         self.tool_journal.append({"name": action_name, "result_summary": None})
+
+    def _infer_intent_from_action(self, action: dict[str, Any]) -> str | None:
+        action_name = action.get("name")
+        if not isinstance(action_name, str):
+            return None
+        if action_name == "respond":
+            content = str(action.get("arguments", {}).get("content", "")).lower()
+            if _contains_any_phrase(content, HANDOFF_PHRASES):
+                return "operator"
+            return self.current_intent
+
+        tool_text = action_name.lower()
+        spec = self.tool_specs.get(action_name)
+        if spec is not None:
+            tool_text = _tool_text(spec)
+
+        if _is_transfer_tool(spec or {"name": action_name, "description": "", "parameters": {}}):
+            return "operator"
+        if _is_lookup_tool(spec or {"name": action_name, "description": "", "parameters": {}}):
+            user_text = extract_user_focus_text(self.current_snapshot or self.current_input_text)
+            return extract_intent(user_text) or self.current_intent or "check"
+        if any(token in tool_text for token in ("cancel", "refund", "void")):
+            return "cancel"
+        if any(token in tool_text for token in ("change", "modify", "update", "reschedule")):
+            return "change"
+        if any(token in tool_text for token in ("book", "create", "purchase", "reserve")):
+            return "book"
+        return self.current_intent
 
     def _update_goal_state(self, *, intent: str, source_text: str) -> None:
         goal_summary = summarize_message(source_text)
@@ -834,17 +880,7 @@ class Agent:
             self.turn_history.append({"role": "user", "content": input_text})
             self._trim_turn_history()
 
-        identifiers = extract_identifiers(input_text)
-        _merge_identifier_state(self.known_identifiers, identifiers)
-
         user_focus_text = extract_user_focus_text(input_text)
-        intent = extract_intent(user_focus_text)
-        if intent:
-            if not self.intent_history or self.intent_history[-1] != intent:
-                self.intent_history.append(intent)
-            self.current_intent = intent
-            self._update_goal_state(intent=intent, source_text=user_focus_text)
-
         if _is_operator_request(user_focus_text):
             self.operator_request_count += 1
 
@@ -904,7 +940,9 @@ class Agent:
 
         validation_tools = self.allowed_tools
         if validation_tools == set():
-            if self.allow_empty_toolset_debug:
+            if action_name == "respond":
+                validation_tools = None
+            elif self.allow_empty_toolset_debug:
                 self.logger.error(
                     "allowed_tools is empty; skipping tool-name validation for this turn because AGENT_ALLOW_EMPTY_TOOLSET_DEBUG is enabled"
                 )
@@ -964,7 +1002,19 @@ class Agent:
                     self.current_input_text,
                     context_text=self._build_context_text(),
                 )
+        action = self._route_validated_action(action)
 
+        return action
+
+    def _route_validated_action(self, action: dict[str, Any]) -> dict[str, Any]:
+        if action.get("name") != "respond":
+            return action
+        content = str(action.get("arguments", {}).get("content", ""))
+        if not _contains_any_phrase(content, HANDOFF_PHRASES):
+            return action
+        transfer_action = self._deterministic_transfer_action()
+        if transfer_action is not None:
+            return transfer_action
         return action
 
     def _repair_action(
@@ -1012,32 +1062,9 @@ class Agent:
             return None
 
     def _choose_deterministic_action(self) -> dict[str, Any] | None:
-        effective_intent = self._effective_intent()
         post_tool_action = self._handle_post_tool_result()
         if post_tool_action is not None:
             return post_tool_action
-
-        if _is_operator_request(self.current_input_text):
-            transfer_action = self._deterministic_transfer_action()
-            if transfer_action is not None:
-                return transfer_action
-            if not policy_allows_handoff(self.current_snapshot or self.initial_prompt):
-                return {
-                    "name": "respond",
-                    "arguments": {
-                        "content": "I can help with that. What do you need assistance with today?"
-                    },
-                }
-
-        tool_action = self._deterministic_tool_action()
-        if tool_action is not None:
-            return tool_action
-
-        if self.allowed_tools and effective_intent in {"cancel", "change", "check", "book"}:
-            missing_hint = self._build_missing_info_response()
-            if missing_hint is not None:
-                return missing_hint
-
         return None
 
     def _effective_intent(self) -> str | None:
@@ -1089,10 +1116,6 @@ class Agent:
                     },
                 }
 
-        next_action = self._deterministic_tool_action(prefer_actions=True)
-        if next_action is not None:
-            return next_action
-
         if effective_intent == "check":
             status = self.structured_facts.get("status")
             if isinstance(status, str) and status:
@@ -1108,6 +1131,10 @@ class Agent:
                     "content": "I've reviewed the reservation details from the latest tool result. Let me know if you want to change or cancel it."
                 },
             }
+
+        next_action = self._deterministic_tool_action(prefer_actions=True)
+        if next_action is not None:
+            return next_action
 
         if effective_intent == "cancel" and (
             self.structured_facts.get("completion") == "cancelled"
