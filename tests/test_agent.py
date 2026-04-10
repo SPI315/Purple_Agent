@@ -13,6 +13,7 @@ from agent import (
     extract_structured_facts,
     extract_allowed_tools,
     extract_allowed_tools_from_tau2_prompt,
+    format_runtime_tool_contract,
     is_disallowed_respond_content,
     parse_action,
     policy_allows_handoff,
@@ -254,6 +255,91 @@ def test_store_user_turn_tracks_goal_history_across_user_requests():
     assert agent.active_goal == agent.goal_history[-1]
 
 
+def test_store_user_turn_builds_pending_tasks_for_multi_intent_request():
+    agent = Agent()
+    agent._store_user_turn(
+        "I’d like to cancel the reservations IFOYYZ and NQNU5R, and for the reservation M20IZO, I’d like to change it to a nonstop flight if that’s available."
+    )
+
+    assert [
+        (task["intent"], task.get("reservation_id"))
+        for task in agent.pending_tasks
+    ] == [
+        ("cancel", "IFOYYZ"),
+        ("cancel", "NQNU5R"),
+        ("change", "M20IZO"),
+    ]
+    assert agent.active_task is not None
+    assert agent.active_task["reservation_id"] == "IFOYYZ"
+
+
+def test_post_tool_completion_advances_to_next_pending_task():
+    agent = Agent()
+    agent._store_user_turn(
+        "Please cancel reservations IFOYYZ and NQNU5R."
+    )
+    agent.tool_specs["cancel_reservation"] = {
+        "name": "cancel_reservation",
+        "description": "Cancel a reservation",
+        "parameters": {
+            "type": "object",
+            "properties": {"reservation_id": {"type": "string"}},
+            "required": ["reservation_id"],
+        },
+    }
+
+    agent._record_action(
+        {"name": "cancel_reservation", "arguments": {"reservation_id": "IFOYYZ"}}
+    )
+    agent.current_input_text = '{"reservation_id":"IFOYYZ","status":"cancelled"}'
+    agent._store_user_turn(agent.current_input_text)
+
+    action = agent._choose_deterministic_action()
+
+    assert action == {
+        "name": "cancel_reservation",
+        "arguments": {"reservation_id": "NQNU5R"},
+    }
+    assert agent.active_task is not None
+    assert agent.active_task["reservation_id"] == "NQNU5R"
+
+
+def test_tool_result_is_bound_to_active_task():
+    agent = Agent()
+    agent._store_user_turn("Please cancel reservation IFOYYZ.")
+    agent._record_action(
+        {"name": "get_reservation_details", "arguments": {"reservation_id": "IFOYYZ"}}
+    )
+
+    result_text = '{"reservation_id":"IFOYYZ","user_id":"aarav_ahmed_6699","status":"confirmed"}'
+    agent.current_input_text = result_text
+    agent._store_user_turn(result_text)
+
+    assert agent.active_task is not None
+    assert agent.active_task["reservation_id"] == "IFOYYZ"
+    assert "confirmed" in (agent.active_task.get("last_result_summary") or "")
+    assert agent.tool_journal[-1]["task_summary"] == agent.active_task["summary"]
+
+
+def test_post_tool_empty_result_uses_honest_past_tense_response():
+    agent = Agent()
+    agent._store_user_turn("Please search for a direct option for reservation M20IZO.")
+    agent._record_action(
+        {
+            "name": "search_direct_flight",
+            "arguments": {"origin": "BOS", "destination": "MSP", "date": "2024-05-18"},
+        }
+    )
+    agent.current_input_text = "[]"
+    agent._store_user_turn("[]")
+
+    action = agent._choose_deterministic_action()
+
+    assert action["name"] == "respond"
+    assert "came back empty" in action["arguments"]["content"]
+    assert "I'll search" not in action["arguments"]["content"]
+
+
 def test_build_fallback_action_uses_reservation_id_when_present():
     action = build_fallback_action("Please cancel reservation EHGLP3 right away.")
     assert action["name"] == "respond"
@@ -333,6 +419,62 @@ def test_extract_allowed_tools_from_tau2_prompt_handles_multiline_json():
     ]
     """
     assert extract_allowed_tools_from_tau2_prompt(tau2_prompt) == {"tool_one", "tool_two"}
+
+
+def test_build_runtime_messages_includes_runtime_tool_contract_after_first_turn():
+    agent = Agent()
+    first_green_message = """
+    Here's a list of tools you can use (you can use at most one tool at a time):
+    [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_user_details",
+          "description": "Lookup a user profile",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "user_id": {"type": "string"}
+            },
+            "required": ["user_id"]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "cancel_reservation",
+          "description": "Cancel a reservation",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "reservation_id": {"type": "string"}
+            },
+            "required": ["reservation_id"]
+          }
+        }
+      }
+    ]
+    user: Please help.
+    """
+    agent._store_user_turn(first_green_message)
+    agent._store_user_turn("user: my user ID is raj_sanchez_7340")
+
+    runtime_messages = agent._build_runtime_messages()
+    tool_contract = "\n".join(
+        message["content"]
+        for message in runtime_messages
+        if message["role"] == "system" and "Runtime tools available right now:" in message["content"]
+    )
+
+    assert "get_user_details" in tool_contract
+    assert "cancel_reservation" in tool_contract
+    assert "user_id:string" in tool_contract
+    assert "reservation_id:string" in tool_contract
+
+
+def test_format_runtime_tool_contract_handles_empty_specs():
+    assert format_runtime_tool_contract({}) == "Runtime tools: none"
 
 
 def test_extract_allowed_tools_from_green_agent_first_message_single_request():

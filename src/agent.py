@@ -245,6 +245,45 @@ def _extract_tool_objects(tool_block: str) -> list[dict[str, Any]]:
     return objects
 
 
+def format_runtime_tool_contract(tool_specs: dict[str, dict[str, Any]]) -> str:
+    if not tool_specs:
+        return "Runtime tools: none"
+
+    lines = ["Runtime tools available right now:"]
+    for name in sorted(tool_specs):
+        spec = tool_specs[name]
+        description = spec.get("description")
+        parameters = spec.get("parameters")
+        properties: list[str] = []
+        required: list[str] = []
+        if isinstance(parameters, dict):
+            raw_properties = parameters.get("properties")
+            if isinstance(raw_properties, dict):
+                for field_name, field_spec in raw_properties.items():
+                    if not isinstance(field_name, str):
+                        continue
+                    field_type = ""
+                    if isinstance(field_spec, dict):
+                        raw_type = field_spec.get("type")
+                        if isinstance(raw_type, str):
+                            field_type = raw_type
+                    properties.append(f"{field_name}:{field_type}" if field_type else field_name)
+            raw_required = parameters.get("required")
+            if isinstance(raw_required, list):
+                required = [item for item in raw_required if isinstance(item, str)]
+
+        parts = [f"- {name}"]
+        if isinstance(description, str) and description.strip():
+            parts.append(f"description={description.strip()}")
+        if properties:
+            parts.append(f"fields={', '.join(properties)}")
+        if required:
+            parts.append(f"required={', '.join(required)}")
+        lines.append("; ".join(parts))
+
+    return "\n".join(lines)
+
+
 def extract_allowed_tools_from_tau2_prompt(text: str) -> set[str]:
     anchor_start = text.find(TAU2_TOOLS_ANCHOR)
     if anchor_start == -1:
@@ -515,7 +554,14 @@ def _is_operator_request(text: str) -> bool:
 
 def _looks_like_tool_result(text: str) -> bool:
     lowered = text.lower()
-    return any(marker in lowered for marker in TOOL_RESULT_MARKERS) or lowered.startswith("error:")
+    stripped = text.strip()
+    return (
+        any(marker in lowered for marker in TOOL_RESULT_MARKERS)
+        or lowered.startswith("error:")
+        or _looks_like_empty_result(stripped)
+        or (stripped.startswith("{") and stripped.endswith("}"))
+        or (stripped.startswith("[") and stripped.endswith("]"))
+    )
 
 
 def _is_lookup_tool(spec: dict[str, Any]) -> bool:
@@ -620,6 +666,70 @@ def extract_user_focus_text(text: str) -> str:
             continue
         lines.append(stripped)
     return "\n".join(lines)
+
+
+def extract_requested_tasks(text: str) -> list[dict[str, str]]:
+    user_text = extract_user_focus_text(text) or text
+    normalized = " ".join(user_text.split())
+    if not normalized:
+        return []
+
+    clauses = [
+        chunk.strip(" .,;")
+        for chunk in re.split(r"(?i)\b(?:and|also)\b", normalized)
+        if chunk.strip(" .,;")
+    ]
+    tasks: list[dict[str, str]] = []
+    last_explicit_intent: str | None = None
+    for clause in clauses:
+        identifiers = extract_identifiers(clause)
+        reservation_ids = identifiers.get("reservation_ids", [])
+        user_ids = identifiers.get("user_ids", [])
+        intent = extract_intent(clause)
+        if intent:
+            last_explicit_intent = intent
+        elif reservation_ids and last_explicit_intent in {"cancel", "change", "check", "book"}:
+            intent = last_explicit_intent
+        if reservation_ids:
+            for reservation_id in reservation_ids:
+                tasks.append(
+                    {
+                        "intent": intent or "check",
+                        "reservation_id": reservation_id,
+                        "summary": summarize_message(clause),
+                        "status": "pending",
+                    }
+                )
+            continue
+        if user_ids and intent:
+            for user_id in user_ids:
+                tasks.append(
+                    {
+                        "intent": intent,
+                        "user_id": user_id,
+                        "summary": summarize_message(clause),
+                        "status": "pending",
+                    }
+                )
+
+    deduped: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for task in tasks:
+        key = (
+            task.get("intent", ""),
+            task.get("reservation_id", ""),
+            task.get("user_id", ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(task)
+    return deduped
+
+
+def _looks_like_empty_result(text: str) -> bool:
+    stripped = text.strip()
+    return stripped in {"[]", "{}", "null", "None"}
 
 
 def split_provider_model(model: str) -> tuple[str | None, str]:
@@ -732,6 +842,9 @@ class Agent:
         self.current_intent: str | None = None
         self.goal_history: list[dict[str, str]] = []
         self.active_goal: dict[str, str] | None = None
+        self.pending_tasks: list[dict[str, Any]] = []
+        self.completed_tasks: list[dict[str, Any]] = []
+        self.active_task: dict[str, Any] | None = None
         self.known_identifiers = {
             "reservation_ids": [],
             "user_ids": [],
@@ -786,6 +899,10 @@ class Agent:
         if not isinstance(action_name, str):
             return
         self.last_action_name = action_name
+        matched_task = self._match_task_for_action(action)
+        if matched_task is not None:
+            self.active_task = matched_task
+            self.active_task["status"] = "in_progress"
         arguments = action.get("arguments")
         if isinstance(arguments, dict):
             self._update_structured_facts(extract_structured_facts(json.dumps(arguments)))
@@ -798,8 +915,14 @@ class Agent:
         if action_name == "respond":
             self.awaiting_tool_result = False
             return
+        self.structured_facts["not_found"] = False
+        self.structured_facts["completion"] = None
         self.awaiting_tool_result = True
-        self.tool_journal.append({"name": action_name, "result_summary": None})
+        task_summary = None
+        if self.active_task is not None:
+            self.active_task["last_tool_name"] = action_name
+            task_summary = self.active_task.get("summary")
+        self.tool_journal.append({"name": action_name, "result_summary": None, "task_summary": task_summary})
 
     def _infer_intent_from_action(self, action: dict[str, Any]) -> str | None:
         action_name = action.get("name")
@@ -838,6 +961,80 @@ class Agent:
         self.goal_history.append(goal)
         self.active_goal = goal
 
+    def _merge_requested_tasks(self, tasks: list[dict[str, str]]) -> None:
+        for task in tasks:
+            reservation_id = task.get("reservation_id")
+            user_id = task.get("user_id")
+            intent = task.get("intent")
+            existing = next(
+                (
+                    candidate
+                    for candidate in self.pending_tasks
+                    if candidate.get("reservation_id") == reservation_id
+                    and candidate.get("user_id") == user_id
+                    and candidate.get("intent") == intent
+                ),
+                None,
+            )
+            if existing is not None:
+                existing["summary"] = task.get("summary", existing.get("summary", ""))
+                if existing.get("status") == "completed":
+                    existing["status"] = "pending"
+                continue
+            self.pending_tasks.append(
+                {
+                    "intent": intent,
+                    "reservation_id": reservation_id,
+                    "user_id": user_id,
+                    "summary": task.get("summary", ""),
+                    "status": task.get("status", "pending"),
+                    "last_tool_name": None,
+                    "last_result_summary": None,
+                    "facts": {},
+                }
+            )
+        if self.active_task is None:
+            self.active_task = self._find_next_pending_task()
+
+    def _find_next_pending_task(self) -> dict[str, Any] | None:
+        for task in self.pending_tasks:
+            if task.get("status") != "completed":
+                return task
+        return None
+
+    def _match_task_for_action(self, action: dict[str, Any]) -> dict[str, Any] | None:
+        arguments = action.get("arguments")
+        reservation_id = None
+        user_id = None
+        if isinstance(arguments, dict):
+            for key, value in arguments.items():
+                lowered = key.lower()
+                if not isinstance(value, str):
+                    continue
+                if any(token in lowered for token in ("reservation", "booking", "confirmation")):
+                    reservation_id = value
+                elif any(token in lowered for token in ("user", "customer", "account", "profile")):
+                    user_id = value
+
+        if reservation_id:
+            for task in self.pending_tasks:
+                if task.get("reservation_id") == reservation_id and task.get("status") != "completed":
+                    return task
+        if user_id:
+            for task in self.pending_tasks:
+                if task.get("user_id") == user_id and task.get("status") != "completed":
+                    return task
+        if self.active_task and self.active_task.get("status") != "completed":
+            return self.active_task
+        return self._find_next_pending_task()
+
+    def _mark_active_task_completed(self) -> None:
+        if self.active_task is None:
+            return
+        self.active_task["status"] = "completed"
+        self.completed_tasks.append(dict(self.active_task))
+        self.active_task = self._find_next_pending_task()
+
     def _update_structured_facts(self, facts: dict[str, Any]) -> None:
         reservation_ids = facts.get("reservation_ids")
         if isinstance(reservation_ids, list):
@@ -855,6 +1052,14 @@ class Agent:
             self.structured_facts["not_found"] = True
         if facts.get("latest_requested"):
             self.structured_facts["latest_requested"] = True
+        if self.active_task is not None:
+            task_facts = self.active_task.setdefault("facts", {})
+            if isinstance(task_facts, dict):
+                task_facts.update(facts)
+            if reservation_ids and not self.active_task.get("reservation_id"):
+                self.active_task["reservation_id"] = reservation_ids[-1]
+            if user_ids and not self.active_task.get("user_id"):
+                self.active_task["user_id"] = user_ids[-1]
 
     def _store_user_turn(self, input_text: str) -> None:
         self.current_snapshot = input_text
@@ -884,6 +1089,11 @@ class Agent:
         if _is_operator_request(user_focus_text):
             self.operator_request_count += 1
 
+        if not (self.awaiting_tool_result and self.last_action_name and _looks_like_tool_result(input_text)):
+            requested_tasks = extract_requested_tasks(user_focus_text)
+            if requested_tasks:
+                self._merge_requested_tasks(requested_tasks)
+
         if self.awaiting_tool_result and self.last_action_name and _looks_like_tool_result(input_text):
             facts = extract_structured_facts(input_text)
             self._update_structured_facts(facts)
@@ -894,8 +1104,11 @@ class Agent:
                     {
                         "name": self.last_action_name,
                         "result_summary": summarize_message(input_text),
+                        "task_summary": self.active_task.get("summary") if self.active_task else None,
                     }
                 )
+            if self.active_task is not None:
+                self.active_task["last_result_summary"] = summarize_message(input_text)
             self.awaiting_tool_result = False
 
     def _trim_turn_history(self) -> None:
@@ -1068,6 +1281,8 @@ class Agent:
         return None
 
     def _effective_intent(self) -> str | None:
+        if self.active_task and isinstance(self.active_task.get("intent"), str):
+            return self.active_task["intent"]
         if self.current_intent:
             return self.current_intent
         if self.active_goal and isinstance(self.active_goal.get("intent"), str):
@@ -1096,6 +1311,9 @@ class Agent:
             return None
 
         effective_intent = self._effective_intent()
+        active_task_summary = None
+        if self.active_task is not None:
+            active_task_summary = self.active_task.get("summary")
 
         if self.last_action_name:
             transfer_spec = self.tool_specs.get(self.last_action_name)
@@ -1106,6 +1324,15 @@ class Agent:
                         "content": TRANSFER_HOLD_MESSAGE
                     },
                 }
+
+        if _looks_like_empty_result(self.current_input_text):
+            detail = " for the current request" if active_task_summary else ""
+            return {
+                "name": "respond",
+                "arguments": {
+                    "content": f"I checked the latest tool result{detail}, but it came back empty. If you'd like, I can try a different approach with the available options."
+                },
+            }
 
         if self.structured_facts.get("not_found") or _tool_result_indicates_not_found(self.current_input_text):
             if effective_intent in {"cancel", "change", "check"}:
@@ -1132,14 +1359,14 @@ class Agent:
                 },
             }
 
-        next_action = self._deterministic_tool_action(prefer_actions=True)
-        if next_action is not None:
-            return next_action
-
         if effective_intent == "cancel" and (
             self.structured_facts.get("completion") == "cancelled"
             or _tool_result_indicates_completion(self.current_input_text)
         ):
+            self._mark_active_task_completed()
+            next_task_action = self._deterministic_tool_action(prefer_actions=True)
+            if next_task_action is not None:
+                return next_task_action
             return {
                 "name": "respond",
                 "arguments": {
@@ -1151,12 +1378,20 @@ class Agent:
             self.structured_facts.get("completion") == "updated"
             or _tool_result_indicates_completion(self.current_input_text)
         ):
+            self._mark_active_task_completed()
+            next_task_action = self._deterministic_tool_action(prefer_actions=True)
+            if next_task_action is not None:
+                return next_task_action
             return {
                 "name": "respond",
                 "arguments": {
                     "content": "Your reservation has been updated."
                 },
             }
+
+        next_action = self._deterministic_tool_action(prefer_actions=True)
+        if next_action is not None:
+            return next_action
 
         return None
 
@@ -1248,13 +1483,22 @@ class Agent:
         if not fields and not required_fields:
             return None
         arguments: dict[str, Any] = {}
+        active_reservation_id = None
+        active_user_id = None
+        if self.active_task is not None:
+            active_reservation_id = self.active_task.get("reservation_id")
+            active_user_id = self.active_task.get("user_id")
         for field in fields:
             lowered = field.lower()
             if any(token in lowered for token in ("reservation", "booking", "confirmation")):
-                if self.known_identifiers["reservation_ids"]:
+                if isinstance(active_reservation_id, str) and active_reservation_id:
+                    arguments[field] = active_reservation_id
+                elif self.known_identifiers["reservation_ids"]:
                     arguments[field] = self.known_identifiers["reservation_ids"][-1]
             elif "user" in lowered or "customer" in lowered or "account" in lowered:
-                if self.known_identifiers["user_ids"]:
+                if isinstance(active_user_id, str) and active_user_id:
+                    arguments[field] = active_user_id
+                elif self.known_identifiers["user_ids"]:
                     arguments[field] = self.known_identifiers["user_ids"][-1]
             elif recent_request and any(token in lowered for token in ("recent", "latest", "most_recent")):
                 arguments[field] = True
@@ -1360,6 +1604,12 @@ class Agent:
 
     def _build_runtime_messages(self) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = [{"role": "system", "content": self.system_prompt}]
+        messages.append(
+            {
+                "role": "system",
+                "content": format_runtime_tool_contract(self.tool_specs),
+            }
+        )
         state_lines = [
             f"Current intent: {self._effective_intent() or 'unknown'}",
             f"Intent history: {', '.join(self.intent_history[-5:]) or 'none'}",
@@ -1374,6 +1624,29 @@ class Agent:
             ),
             f"Known reservation IDs: {', '.join(self.known_identifiers['reservation_ids'][-3:]) or 'none'}",
             f"Known user IDs: {', '.join(self.known_identifiers['user_ids'][-3:]) or 'none'}",
+            (
+                "Active task: "
+                + (
+                    f"{self.active_task.get('intent', 'unknown')} "
+                    f"{self.active_task.get('reservation_id') or self.active_task.get('user_id') or ''} "
+                    f"[{self.active_task.get('status', 'pending')}]"
+                ).strip()
+                if self.active_task
+                else "Active task: none"
+            ),
+            (
+                "Pending tasks: "
+                + " | ".join(
+                    (
+                        f"{task.get('intent', 'unknown')} "
+                        f"{task.get('reservation_id') or task.get('user_id') or ''} "
+                        f"[{task.get('status', 'pending')}]"
+                    ).strip()
+                    for task in self.pending_tasks[-5:]
+                )
+                if self.pending_tasks
+                else "Pending tasks: none"
+            ),
             f"Structured status: {self.structured_facts.get('status') or 'unknown'}",
             f"Structured eligibility: {self.structured_facts.get('eligibility') or 'unknown'}",
             f"Structured completion: {self.structured_facts.get('completion') or 'none'}",
